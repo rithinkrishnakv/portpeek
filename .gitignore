@@ -1,0 +1,19 @@
+# Build output
+/bin/
+/portpeek
+
+# Go
+*.test
+*.out
+
+# Local databases (PortPeek's own data, never part of the repo)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Editor/OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
