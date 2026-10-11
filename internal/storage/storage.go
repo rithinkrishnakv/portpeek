@@ -22,7 +22,7 @@ import (
 // version must never be silently stamped over, which would both discard
 // the information that a newer schema exists and risk operating on tables
 // or columns this build doesn't know about.
-const schemaVersion = 1
+const schemaVersion = 2
 
 // ErrSchemaTooNew is returned by Open when the database's recorded schema
 // version is newer than this build of PortPeek understands - e.g. the
@@ -73,13 +73,23 @@ func (s *Store) Close() error {
 // the baseline schema statements, so a multi-version-old database upgrades
 // through every intermediate step in one Open() call.
 //
-// There is nothing here yet because schema version 1 is still the only
-// version that has ever shipped; this exists so the *next* schema change
-// has an established, tested place to go instead of editing the
-// CREATE TABLE statements below in place, which would silently skip
-// already-initialized databases that need the new column added instead of
-// (harmlessly) re-created.
-var migrations = map[int][]string{}
+// Version 2 adds assets.allow_public_target (internal/safety's
+// public-target scan guard - see cmd_add.go/cmd_scan.go): an explicit,
+// persistent per-asset opt-out of the confirmation PortPeek otherwise
+// requires before scanning a target that resolves to a public address.
+// Deliberately an ALTER TABLE here rather than added to the assets
+// CREATE TABLE below, for exactly the reason explained above: this same
+// migration step is what brings a version-1 database's existing assets
+// table up to date, and it must behave identically whether the table was
+// just freshly created this call or has existed since version 1 - adding
+// the column to the CREATE TABLE statement instead would silently skip
+// every already-initialized database, which is the one case migrations
+// exist to handle.
+var migrations = map[int][]string{
+	2: {
+		`ALTER TABLE assets ADD COLUMN allow_public_target INTEGER NOT NULL DEFAULT 0`,
+	},
+}
 
 func (s *Store) init() error {
 	tx, err := s.db.Begin()

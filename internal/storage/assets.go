@@ -28,6 +28,13 @@ type Asset struct {
 	CertFingerprint       *string
 	SSHHostKeyFingerprint *string
 	MDNSIdentity          *string
+	// AllowPublicTarget is an explicit, persistent opt-out of the
+	// public-target scan confirmation (see internal/safety and
+	// cmd_scan.go's --confirm-public-target): once true, `scan` no
+	// longer asks for per-invocation confirmation when this asset's host
+	// resolves to a public address. Set via `add --allow-public-target`
+	// or SetAllowPublicTarget; false by default for every asset.
+	AllowPublicTarget bool
 }
 
 // CreateAsset registers a new asset. Returns ErrAlreadyExists if the label
@@ -54,7 +61,7 @@ func (s *Store) CreateAsset(label, host string) (Asset, error) {
 func (s *Store) GetAsset(label string) (Asset, error) {
 	row := s.db.QueryRow(
 		`SELECT id, label, host, created_at, mac_address, cert_fingerprint,
-		        ssh_host_key_fingerprint, mdns_identity
+		        ssh_host_key_fingerprint, mdns_identity, allow_public_target
 		 FROM assets WHERE label = ?`, label,
 	)
 	return scanAsset(row)
@@ -64,17 +71,37 @@ func (s *Store) GetAsset(label string) (Asset, error) {
 func (s *Store) GetAssetByID(id int64) (Asset, error) {
 	row := s.db.QueryRow(
 		`SELECT id, label, host, created_at, mac_address, cert_fingerprint,
-		        ssh_host_key_fingerprint, mdns_identity
+		        ssh_host_key_fingerprint, mdns_identity, allow_public_target
 		 FROM assets WHERE id = ?`, id,
 	)
 	return scanAsset(row)
+}
+
+// SetAllowPublicTarget persists this asset's explicit, standing opt-out of
+// the public-target scan confirmation (see internal/safety). It is kept
+// separate from CreateAsset rather than added as a new parameter so
+// CreateAsset's existing signature - and every one of its many existing
+// callers, test and production alike - is left untouched.
+func (s *Store) SetAllowPublicTarget(assetID int64, allow bool) error {
+	res, err := s.db.Exec(`UPDATE assets SET allow_public_target = ? WHERE id = ?`, allow, assetID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // ListAssets returns all assets, ordered by label.
 func (s *Store) ListAssets() ([]Asset, error) {
 	rows, err := s.db.Query(
 		`SELECT id, label, host, created_at, mac_address, cert_fingerprint,
-		        ssh_host_key_fingerprint, mdns_identity
+		        ssh_host_key_fingerprint, mdns_identity, allow_public_target
 		 FROM assets ORDER BY label`,
 	)
 	if err != nil {
@@ -118,8 +145,9 @@ func scanAsset(row rowScanner) (Asset, error) {
 	var a Asset
 	var createdAt string
 	var mac, certFP, sshFP, mdns sql.NullString
+	var allowPublic bool
 
-	err := row.Scan(&a.ID, &a.Label, &a.Host, &createdAt, &mac, &certFP, &sshFP, &mdns)
+	err := row.Scan(&a.ID, &a.Label, &a.Host, &createdAt, &mac, &certFP, &sshFP, &mdns, &allowPublic)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Asset{}, ErrNotFound
 	}
@@ -132,6 +160,7 @@ func scanAsset(row rowScanner) (Asset, error) {
 	a.CertFingerprint = nullableString(certFP)
 	a.SSHHostKeyFingerprint = nullableString(sshFP)
 	a.MDNSIdentity = nullableString(mdns)
+	a.AllowPublicTarget = allowPublic
 	return a, nil
 }
 

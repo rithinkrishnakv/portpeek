@@ -40,12 +40,38 @@ type portProto struct {
 // Every event kind - NEW_PORT, PORT_CLOSED, SERVICE_CHANGED,
 // SERVICE_DISAPPEARED, EXPECTED_SERVICE_MISSING alike - goes through
 // exactly the same two-scan pending -> confirmed rule, with no shortcuts:
-// a condition must be observed on two consecutive scans before it is
-// confirmed drift, and a "filtered" or "timeout" reading never counts as
-// an observation of anything for this purpose (see internal/diff's
-// Compute, and the PORT_CLOSED derivation below, for where that's
-// enforced). This is what keeps a transient scan failure from ever
-// producing a false confirmed-drift result.
+// a condition must be observed on two consecutive *definitive* scans
+// before it is confirmed drift.
+//
+// The formal rule for "consecutive" - this is the part that governs how
+// "filtered" and "timeout" readings interact with a pending or confirmed
+// event, spelled out explicitly since it's easy to get subtly wrong:
+//
+//   - A reading of "open" or "closed" is definitive: it is real evidence,
+//     and only a definitive reading ever creates, advances (scan_count
+//     and status), resolves, or cancels an event. See internal/diff's
+//     Compute and the PORT_CLOSED derivation below for the one definitive
+//     case each kind reacts to.
+//   - A reading of "filtered" or "timeout" is never evidence of anything
+//   - not of the original condition continuing, and not of it having
+//     gone away. For this purpose it is handled identically to the port
+//     simply not having been scanned this round at all: no event is
+//     created, touched, confirmed, resolved, or cancelled because of it.
+//   - Consequently, an uncertain reading *pauses* an in-progress
+//     confirmation streak rather than resetting or advancing it: a
+//     pending event stays pending at the same scan_count, and a confirmed
+//     event stays confirmed at the same scan_count, until the next
+//     definitive reading for that port arrives - however many scans in a
+//     row are uncertain in between. "Two consecutive scans" therefore
+//     means two consecutive *definitive* scans of the same condition, not
+//     two consecutive calls to Reconcile.
+//
+// This is what keeps a transient scan failure from ever producing a false
+// confirmed-drift result, and - just as important - from ever silently
+// erasing a real one. See internal/events/events_test.go's
+// "Release-review regression suite" for the explicit pending/confirmed x
+// timeout/filtered coverage of this contract, including its application
+// to PORT_CLOSED's own, separately-tracked confirmation cycle.
 func Reconcile(st *storage.Store, assetID int64, observations []storage.Observation) (Summary, error) {
 	var summary Summary
 

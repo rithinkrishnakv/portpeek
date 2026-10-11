@@ -12,7 +12,14 @@ prototype.
 
 ### Added
 
-- Asset management: `add`, `list`, `remove`.
+- Asset management: `add`, `list`, `remove`, `allow-public-target`.
+- Public-target scan guard (`internal/safety`): `scan` refuses by default to
+  scan an asset whose host resolves to a public (non-private) address,
+  catching a typo'd IP or an unexpectedly-resolving hostname before any
+  packet is sent. Confirm intentionally per-invocation with
+  `scan --confirm-public-target`, or persistently per-asset with
+  `add --allow-public-target` / `allow-public-target <asset>`. See the
+  README's "Public targets" section.
 - Lightweight, non-destructive TCP connect scanner (`scan`) with
   configurable port specs (`--ports`, e.g. `22,80,443` or `1-1000`),
   timeout, and concurrency.
@@ -114,6 +121,25 @@ publish:
   versions (1.21/1.22) to the two currently-supported Go major releases
   (1.26/1.27 as of this review), and bumped `actions/checkout`/
   `actions/setup-go` to their current major versions (v5/v6).
+- **README described the old, already-fixed `PORT_CLOSED` behavior.**
+  "How drift detection works" still claimed `PORT_CLOSED` is reported
+  "immediately confirmed (not pending)" off a single closed reading - the
+  exact pre-fix behavior described above under "False drift confirmation
+  from uncertain reads", which the code no longer does and has dedicated
+  regression tests against. Corrected to match actual (and intended)
+  behavior: every event kind, `PORT_CLOSED` included, requires two
+  consecutive *definitive* (`open`/`closed`) readings to confirm, and
+  `filtered`/`timeout` readings pause an in-progress confirmation streak
+  without ever resetting, advancing, confirming, resolving, or cancelling
+  it. `internal/events.Reconcile`'s doc comment now states this contract
+  explicitly, and `internal/events/events_test.go` has dedicated coverage
+  for all six documented scan sequences (`closed -> timeout -> closed`,
+  `closed -> filtered -> closed`, `closed -> closed`,
+  `closed -> timeout -> open`, a confirmed non-`NEW_PORT` event followed
+  by a timeout, and the same pause-then-confirm pattern applied to a
+  tracked `NEW_PORT`'s own `PORT_CLOSED` derivation), each checking event
+  status, `scan_count`, the resulting exit code, and that no duplicate
+  event row is ever created.
 
 ### Known limitations
 

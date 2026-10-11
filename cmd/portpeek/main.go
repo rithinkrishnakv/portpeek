@@ -34,6 +34,8 @@ func run(args []string) int {
 	switch cmd {
 	case "add":
 		return cmdAdd(rest)
+	case "allow-public-target":
+		return cmdAllowPublicTarget(rest)
 	case "list":
 		return cmdList(rest)
 	case "scan":
@@ -72,6 +74,7 @@ USAGE
 
 COMMANDS
   add <label> <host>        Register a new asset
+  allow-public-target <asset>  Allow/require confirmation for scanning a public-resolving asset
   list                      List registered assets
   scan <asset>               Scan an asset and record observations
   baseline <asset>          Accept the current observed state as expected

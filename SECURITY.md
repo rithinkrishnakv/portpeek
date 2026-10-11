@@ -54,6 +54,14 @@ this policy — but if you discover that PortPeek's own behavior could make
 unauthorized misuse easier (e.g., a way to bypass its safety posture), that
 *is* in scope and we want to hear about it.
 
+As one concrete, limited safeguard against the most common *accidental*
+case — not a substitute for the authorization requirement above, which no
+automated check can verify — `scan` refuses by default to scan an asset
+whose host resolves to a public (non-private) address, catching a typo'd
+IP or a hostname that resolves somewhere unexpected before any packet is
+sent. See the README's "Public targets" section for how to confirm a scan
+is intentional.
+
 ## What Counts as a Vulnerability Here
 
 Examples of in-scope reports:

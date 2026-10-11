@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/rithinkrishnakv/portpeek/internal/config"
 	"github.com/rithinkrishnakv/portpeek/internal/output"
+	"github.com/rithinkrishnakv/portpeek/internal/safety"
 	"github.com/rithinkrishnakv/portpeek/internal/storage"
 )
 
@@ -93,10 +95,48 @@ func mustAsset(st *storage.Store, label string) (storage.Asset, bool) {
 
 func assetToJSON(a storage.Asset) output.AssetJSON {
 	return output.AssetJSON{
-		Label:     a.Label,
-		Host:      a.Host,
-		CreatedAt: a.CreatedAt.Format(time.RFC3339),
+		Label:             a.Label,
+		Host:              a.Host,
+		CreatedAt:         a.CreatedAt.Format(time.RFC3339),
+		AllowPublicTarget: a.AllowPublicTarget,
 	}
+}
+
+// checkPublicTargetAllowed is the public-target scan guard shared by every
+// command that actually dials a target (currently just `scan`, for both
+// its persisted and --no-save paths). It resolves and classifies
+// asset.Host and, if any resolved address is not private/loopback,
+// refuses to proceed unless the caller has explicitly allowed it - either
+// as a standing, persistent opt-out on the asset itself
+// (asset.AllowPublicTarget, set via `add --allow-public-target`), or for
+// this one invocation only (confirmFlag, set via `scan
+// --confirm-public-target`). On refusal it prints an explanatory error
+// itself and returns false; callers should return ExitError in that case.
+//
+// This is deliberately a check performed immediately before scanning,
+// using the same resolver behavior the scanner's own dialer will see
+// moments later - not a one-time check at `add` time - because a
+// hostname's resolution can change between when an asset was added and
+// when it is scanned.
+func checkPublicTargetAllowed(ctx context.Context, asset storage.Asset, confirmFlag bool) bool {
+	if asset.AllowPublicTarget || confirmFlag {
+		return true
+	}
+
+	c, err := safety.Classify(ctx, asset.Host)
+	if err != nil {
+		errorf("resolve target %q for safety check: %v", asset.Host, err)
+		return false
+	}
+	if c.AllPrivate {
+		return true
+	}
+
+	errorf("asset %q (%s) resolves to a non-private address and scanning it has not been confirmed", asset.Label, asset.Host)
+	fmt.Fprintln(os.Stderr, "portpeek: refusing to scan a public target without explicit confirmation, to avoid accidentally scanning hosts you don't control.")
+	fmt.Fprintln(os.Stderr, "portpeek: to scan this target once, re-run with --confirm-public-target.")
+	fmt.Fprintf(os.Stderr, "portpeek: to always allow this asset, run: portpeek allow-public-target %s\n", asset.Label)
+	return false
 }
 
 func expectedToJSON(e storage.Expected) output.ExpectedJSON {

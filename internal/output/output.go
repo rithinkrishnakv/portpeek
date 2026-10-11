@@ -68,9 +68,10 @@ type DiffResult struct {
 }
 
 type AssetJSON struct {
-	Label     string `json:"label"`
-	Host      string `json:"host"`
-	CreatedAt string `json:"created_at"`
+	Label             string `json:"label"`
+	Host              string `json:"host"`
+	CreatedAt         string `json:"created_at"`
+	AllowPublicTarget bool   `json:"allow_public_target"`
 }
 
 type ExpectedJSON struct {

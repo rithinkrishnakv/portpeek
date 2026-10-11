@@ -22,8 +22,9 @@ func cmdScan(args []string) int {
 	jsonOut := fs.Bool("json", false, "print results as JSON")
 	quiet := fs.Bool("quiet", false, "suppress the observation table; only print the final summary line")
 	noSave := fs.Bool("no-save", false, "perform a temporary scan without writing persistent state")
+	confirmPublic := fs.Bool("confirm-public-target", false, "confirm, for this invocation only, scanning a target that resolves to a public (non-private) address")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: portpeek scan <asset> [--ports SPEC] [--timeout MS] [--json] [--quiet] [--no-save]")
+		fmt.Fprintln(os.Stderr, "usage: portpeek scan <asset> [--ports SPEC] [--timeout MS] [--json] [--quiet] [--no-save] [--confirm-public-target]")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(reorderArgs(fs, args)); err != nil {
@@ -64,6 +65,11 @@ func cmdScan(args []string) int {
 	}
 
 	ctx := context.Background()
+
+	if !checkPublicTargetAllowed(ctx, asset, *confirmPublic) {
+		return ExitError
+	}
+
 	startedAt := time.Now()
 
 	results := scanner.Scan(ctx, asset.Host, ports, scanner.Options{

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -32,8 +33,84 @@ func TestOpenFreshDatabaseRecordsCurrentSchemaVersion(t *testing.T) {
 	if err := st.db.QueryRow(`SELECT value FROM schema_meta WHERE key = 'version'`).Scan(&stored); err != nil {
 		t.Fatalf("read back schema version: %v", err)
 	}
-	if stored != "1" {
-		t.Fatalf("expected schema version '1' for a fresh database, got %q", stored)
+	// Compared against the schemaVersion constant, not a hardcoded
+	// literal, so this test keeps passing (and keeps meaning the same
+	// thing) across future schema bumps instead of needing a manual edit
+	// every time - the version this test actually cares about is "the
+	// current one", not any specific number.
+	if want := strconv.Itoa(schemaVersion); stored != want {
+		t.Fatalf("expected schema version %q for a fresh database, got %q", want, stored)
+	}
+}
+
+// TestOpenMigratesV1DatabaseToV2 is the regression test for the
+// migrations map actually working, not just being present: it builds a
+// genuine version-1-shaped database by hand (the exact CREATE TABLE SQL
+// version 1 shipped with - no allow_public_target column - and
+// schema_meta stamped "1"), puts a real asset in it, then opens it with
+// today's Store.Open and checks that the migration ran: the schema
+// version advances to current, the pre-existing asset survives with its
+// data intact and AllowPublicTarget defaulting to false (the column's
+// DEFAULT 0), and the database is left fully usable afterward.
+func TestOpenMigratesV1DatabaseToV2(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "portpeek.db")
+
+	raw, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("open raw v1 database: %v", err)
+	}
+	v1Stmts := []string{
+		`CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+		`CREATE TABLE assets (
+			id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+			label                    TEXT NOT NULL UNIQUE,
+			host                     TEXT NOT NULL,
+			created_at               TEXT NOT NULL,
+			mac_address              TEXT,
+			cert_fingerprint         TEXT,
+			ssh_host_key_fingerprint TEXT,
+			mdns_identity            TEXT
+		)`,
+		`INSERT INTO schema_meta(key, value) VALUES ('version', '1')`,
+		`INSERT INTO assets(label, host, created_at) VALUES ('legacy', '10.0.0.9', '2025-01-01T00:00:00Z')`,
+	}
+	for _, stmt := range v1Stmts {
+		if _, err := raw.Exec(stmt); err != nil {
+			t.Fatalf("build v1 fixture (%s): %v", stmt, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw v1 database: %v", err)
+	}
+
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open (migrate v1 -> current): %v", err)
+	}
+	defer st.Close()
+
+	var stored string
+	if err := st.db.QueryRow(`SELECT value FROM schema_meta WHERE key = 'version'`).Scan(&stored); err != nil {
+		t.Fatalf("read back schema version: %v", err)
+	}
+	if want := strconv.Itoa(schemaVersion); stored != want {
+		t.Fatalf("expected migration to advance schema version to %q, got %q", want, stored)
+	}
+
+	legacy, err := st.GetAsset("legacy")
+	if err != nil {
+		t.Fatalf("expected the pre-existing v1 asset to survive migration: %v", err)
+	}
+	if legacy.Host != "10.0.0.9" {
+		t.Fatalf("expected pre-existing asset data to survive migration intact, got %+v", legacy)
+	}
+	if legacy.AllowPublicTarget {
+		t.Fatalf("expected the new allow_public_target column to default to false for a migrated row, got true")
+	}
+
+	// The database must remain fully usable after migration.
+	if _, err := st.CreateAsset("new-after-migration", "10.0.0.10"); err != nil {
+		t.Fatalf("expected the database to remain writable after migration: %v", err)
 	}
 }
 

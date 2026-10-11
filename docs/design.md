@@ -233,6 +233,71 @@ under Go's default pooling behavior. This is a deliberate trade against
 theoretical concurrency PortPeek doesn't need: it's a CLI tool invoked by
 one user (or one cron job) at a time, not a multi-tenant server.
 
+### Schema migrations
+
+`schemaVersion` and the `migrations` map in `internal/storage/storage.go`
+exist specifically so the nullable-identity-fields groundwork described
+above has somewhere to go when it's eventually filled in, without a
+disruptive schema rewrite. `migrations[v]` holds the additive-only SQL
+(`ALTER TABLE ... ADD COLUMN`, never `DROP` or a data-discarding rewrite)
+that brings a database from version `v-1` to version `v`; `init()` applies
+every step from the database's recorded version up to current, in order,
+inside the same transaction as the baseline `CREATE TABLE IF NOT EXISTS`
+statements - so a multi-version-old database catches up fully in one
+`Open()` call, and a brand-new database and an already-current one both
+take the no-op `IF NOT EXISTS` path for the baseline statements and skip
+the migration loop entirely.
+
+This was exercised for the first time in version 2, which adds
+`assets.allow_public_target` (see "Guarding against accidental
+public-target scans" below) - deliberately as a migration step rather
+than by editing the `assets` `CREATE TABLE` statement directly, since the
+whole point of a migration is to bring an *existing* database's table up
+to date; editing the `CREATE TABLE` statement instead would silently skip
+every database that was already initialized before the column was added.
+`TestOpenMigratesV1DatabaseToV2` in `internal/storage/schema_test.go`
+hand-builds a genuine version-1-shaped database and verifies the upgrade
+path end-to-end, rather than only checking that the migration scaffolding
+is present.
+
+### Guarding against accidental public-target scans
+
+PortPeek's authorized-use policy (README, `SECURITY.md`) is a human
+agreement no automated check can verify - PortPeek cannot know whether
+you have permission to scan a given host. What it *can* catch is the much
+more common accident: a typo'd IP, or a hostname that resolves somewhere
+other than where you expected. `internal/safety` classifies a scan
+target's resolved address(es) using the standard library's own
+loopback/private/link-local logic (`net.IP.IsLoopback`, `IsPrivate`,
+`IsLinkLocalUnicast`/`Multicast`, `IsUnspecified`) rather than hand-rolled
+CIDR math, and `cmd scan` refuses to proceed - before any network
+connection is attempted - when any resolved address is not one of those.
+
+Two design choices worth calling out:
+
+- **CGNAT (`100.64.0.0/10`) is treated as public**, matching Go's own
+  `IsPrivate` (which deliberately excludes it). CGNAT is routable within
+  an ISP's shared address space, and PortPeek has no way to know whether
+  that counts as "safe" for a given user's network - so it stays on the
+  confirm-required side rather than guessing.
+- **A hostname that resolves to a mix of private and public addresses is
+  treated as public overall**, not partially allowed. PortPeek's scanner
+  connects to whatever address the dialer actually resolves at scan time,
+  the same resolution `safety.Classify` performs - it cannot assume that
+  will be the private one, so the conservative answer is the only safe
+  one.
+
+Confirmation is two-tiered rather than a single global switch: `scan
+--confirm-public-target` is a one-off, per-invocation bypass, while
+`add --allow-public-target` / `allow-public-target <asset>` is a
+persistent, per-asset opt-out (a new `assets.allow_public_target` column,
+set via `Store.SetAllowPublicTarget` rather than as a new `CreateAsset`
+parameter, to avoid touching that function's signature and its many
+existing call sites). Both are deliberately opt-in and scoped to a single
+asset or a single invocation - there is no "disable this check globally"
+flag, since the entire point is to require a conscious decision each time
+a target turns out not to be private.
+
 ## Exit codes are a stable contract
 
 `0` / `1` / `2` / `3` (clean / confirmed drift / error / pending drift)

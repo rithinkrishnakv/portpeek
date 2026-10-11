@@ -34,6 +34,7 @@ matching reality.
 - [Data storage](#data-storage)
 - [Using PortPeek unattended (cron/systemd/CI)](#using-portpeek-unattended-cronsystemdci)
 - [Responsible use](#responsible-use)
+  - [Public targets](#public-targets)
 - [Limitations](#limitations)
 - [Roadmap](#roadmap)
 - [Development](#development)
@@ -206,6 +207,28 @@ Added asset "home-server" -> 192.168.1.50
 Next: portpeek scan home-server
 ```
 
+Flags:
+
+- `--json` — print the created asset as JSON.
+- `--allow-public-target` — persistently allow scanning this asset even if
+  its host resolves to a public (non-private) address, without per-scan
+  confirmation. See [Public targets](#public-targets) below. Off by
+  default; use `allow-public-target <asset>` to change it later.
+
+### `allow-public-target <asset>`
+
+Sets (or, with `--off`, clears) an existing asset's standing opt-out of
+the public-target scan confirmation described in
+[Public targets](#public-targets). `add --allow-public-target` covers
+this at creation time; use this command for an asset that already exists.
+
+```console
+$ portpeek allow-public-target home-server
+"home-server" will no longer require per-scan confirmation for public targets.
+$ portpeek allow-public-target home-server --off
+"home-server" will now require confirmation again before scanning a public target.
+```
+
 ### `list`
 
 Lists registered assets. Supports `--json`.
@@ -226,6 +249,9 @@ Flags:
 - `--quiet` — suppress the port table; print only the final summary.
 - `--no-save` — perform the scan but don't persist it or evaluate drift
   (useful for a quick, throwaway look).
+- `--confirm-public-target` — confirm, for this invocation only, scanning
+  a target that resolves to a public address. See
+  [Public targets](#public-targets).
 
 ### `baseline <asset>`
 
@@ -376,12 +402,24 @@ simply dropped — it was noise, not a real change. This two-scan
 confirmation exists specifically to avoid alert fatigue from transient
 blips (a service restarting mid-scan, a brief firewall change, etc.).
 
-One asymmetry worth knowing: once a `NEW_PORT` has been *confirmed*, if
-that port later closes, PortPeek reports the resulting `PORT_CLOSED`
-*immediately confirmed* (not pending) — because it's derived from two
-already-confirmed facts (a port that passed its own two-scan confirmation
-as open, and a fresh scan showing it's no longer open), not from a single
-unconfirmed observation.
+**Every event kind — `PORT_CLOSED` included — is held to the identical
+two-scan rule, with no shortcut.** Once a `NEW_PORT` has been *confirmed*,
+a port that then reads closed starts a `PORT_CLOSED` event *pending*, the
+same as any other new finding; only a second, consecutive closed reading
+confirms it, at which point the original `NEW_PORT` event is resolved. A
+single closed reading never confirms `PORT_CLOSED` immediately, however
+confirmed the prior "open" history was — a dropped packet or a transient
+firewall blip could otherwise flip a confirmed exposure straight to
+confirmed drift off one scan, which is exactly the false-positive
+confirmation two-scan confirmation exists to prevent.
+
+`filtered`/`timeout` readings never count as evidence of anything, for
+any event kind: a pending event's confirmation streak simply pauses on
+such a reading — unchanged, not reset, not advanced, not cancelled — and
+a confirmed event stays confirmed unchanged, exactly as if that port
+hadn't been scanned at all this round. Only a genuinely definitive
+reading (`open` or `closed`) ever confirms, resolves, or cancels
+anything.
 
 PortPeek never reports drift for a port it didn't actually scan this time
 (e.g. if you ran with a narrower `--ports` range) — an unscanned expected
@@ -523,6 +561,32 @@ keep its findings trustworthy:
 - Lightweight, non-destructive fingerprinting only.
 - Never claims a vulnerability from an open port or banner alone.
 - No automatic network discovery — you tell it what to scan.
+
+### Public targets
+
+PortPeek also refuses, by default, to scan an asset whose host resolves to
+a public (non-private) address — this catches the common *accident* (a
+typo'd IP, a hostname that resolves somewhere you didn't expect), not a
+substitute for the authorization requirement above, which no automated
+check can verify. An address is considered private if it's loopback,
+RFC1918/RFC4193 private, or link-local; everything else, including CGNAT
+(`100.64.0.0/10`), is treated as public, since PortPeek has no way to know
+whether that counts as "safe" for your network.
+
+```console
+$ portpeek scan some-host
+portpeek: error: asset "some-host" (203.0.113.9) resolves to a non-private address and scanning it has not been confirmed
+portpeek: refusing to scan a public target without explicit confirmation, to avoid accidentally scanning hosts you don't control.
+portpeek: to scan this target once, re-run with --confirm-public-target.
+portpeek: to always allow this asset, run: portpeek allow-public-target some-host
+```
+
+Confirm intentionally with either:
+
+- `scan <asset> --confirm-public-target` — for this one invocation only.
+- `portpeek allow-public-target <asset>` (or `add --allow-public-target`
+  at creation time) — a standing opt-out for that asset, revert with
+  `allow-public-target <asset> --off`.
 
 See [SECURITY.md](SECURITY.md) for how to report a security issue in
 PortPeek itself.
