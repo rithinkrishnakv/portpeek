@@ -16,6 +16,20 @@ const (
 	EventExpectedServiceMissing = "EXPECTED_SERVICE_MISSING"
 )
 
+// AllEventKinds lists every event Kind that exists. `accept` and
+// `baseline` both use this to mark every active event for a port
+// accepted, regardless of kind, when the user approves that port's
+// current state - trying to accept a kind with no active event for that
+// port is a harmless no-op, so there is no reason for either command to
+// maintain its own narrower, easy-to-forget-to-update list.
+var AllEventKinds = []string{
+	EventNewPort,
+	EventServiceChanged,
+	EventServiceDisappeared,
+	EventExpectedServiceMissing,
+	EventPortClosed,
+}
+
 // Event statuses.
 const (
 	StatusPending   = "pending"

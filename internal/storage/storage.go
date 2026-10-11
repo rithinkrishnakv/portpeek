@@ -5,16 +5,33 @@ package storage
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// schemaVersion is bumped whenever the schema changes. It is recorded in
-// schema_meta so future releases can detect and migrate older databases
-// without a destructive reset.
-const schemaVersion = "1"
+// schemaVersion is bumped whenever the on-disk schema changes. It is
+// recorded in schema_meta so a given build of PortPeek can tell an empty
+// database (never initialized), an older database (needs migrating up),
+// and - critically - a *newer* database (written by a later version of
+// PortPeek than this one) apart, and treat each correctly. See init()
+// below for how each case is handled; in particular, a newer-than-known
+// version must never be silently stamped over, which would both discard
+// the information that a newer schema exists and risk operating on tables
+// or columns this build doesn't know about.
+const schemaVersion = 1
+
+// ErrSchemaTooNew is returned by Open when the database's recorded schema
+// version is newer than this build of PortPeek understands - e.g. the
+// database was last written by a newer PortPeek release and then opened
+// with an older binary. PortPeek refuses to touch such a database rather
+// than guessing: silently stamping its own (older) version over the
+// recorded one would both lose the fact that a newer schema was in use
+// and risk corrupting tables or columns this build doesn't know about.
+var ErrSchemaTooNew = errors.New("database schema is newer than this version of portpeek understands")
 
 // Store wraps the SQLite connection and exposes PortPeek's data operations.
 type Store struct {
@@ -46,12 +63,64 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// migrations holds the schema changes needed to bring a database up from
+// one version to the next, keyed by the version being migrated *to* (so
+// migrations[2] is "how to get from schema version 1 to version 2", and
+// so on). Every entry must be additive and non-destructive: ALTER TABLE
+// ADD COLUMN, CREATE TABLE IF NOT EXISTS, CREATE INDEX IF NOT EXISTS,
+// backfilling a new nullable column - never DROP or data-discarding
+// rewrites. init() applies these in order inside the same transaction as
+// the baseline schema statements, so a multi-version-old database upgrades
+// through every intermediate step in one Open() call.
+//
+// There is nothing here yet because schema version 1 is still the only
+// version that has ever shipped; this exists so the *next* schema change
+// has an established, tested place to go instead of editing the
+// CREATE TABLE statements below in place, which would silently skip
+// already-initialized databases that need the new column added instead of
+// (harmlessly) re-created.
+var migrations = map[int][]string{}
+
 func (s *Store) init() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// schema_meta itself must exist before anything else so its recorded
+	// version can be read before any other table is touched - this is
+	// what lets a too-new database be detected and refused before this
+	// build does anything else to it.
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS schema_meta (
+		key   TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("init schema_meta: %w", err)
+	}
+
+	storedVersion := 0 // 0 means "brand-new database, nothing recorded yet"
+	var raw string
+	err = tx.QueryRow(`SELECT value FROM schema_meta WHERE key = 'version'`).Scan(&raw)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// Brand-new database (or one from before schema_meta existed at
+		// all) - storedVersion stays 0, proceed to initialize fresh.
+	case err != nil:
+		return fmt.Errorf("read schema version: %w", err)
+	default:
+		storedVersion, err = strconv.Atoi(raw)
+		if err != nil {
+			return fmt.Errorf("database has an unreadable schema version %q: %w", raw, err)
+		}
+	}
+
+	if storedVersion > schemaVersion {
+		return fmt.Errorf("%w: database is at schema version %d, this build of portpeek only understands up to version %d - upgrade portpeek before opening this database",
+			ErrSchemaTooNew, storedVersion, schemaVersion)
+	}
+
 	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS schema_meta (
-			key   TEXT PRIMARY KEY,
-			value TEXT NOT NULL
-		)`,
 		`CREATE TABLE IF NOT EXISTS assets (
 			id                       INTEGER PRIMARY KEY AUTOINCREMENT,
 			label                    TEXT NOT NULL UNIQUE,
@@ -114,24 +183,35 @@ func (s *Store) init() error {
 		`CREATE INDEX IF NOT EXISTS idx_events_asset_port ON events(asset_id, kind, port, proto)`,
 	}
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback() //nolint:errcheck
-
+	// The baseline CREATE TABLE/INDEX statements are all IF NOT EXISTS,
+	// so they are safe and a no-op to re-run against a database that's
+	// already at schemaVersion - this covers both storedVersion == 0
+	// (brand-new) and storedVersion == schemaVersion (already current) in
+	// one pass. A database strictly between versions (storedVersion > 0
+	// and < schemaVersion) additionally needs every migration step from
+	// storedVersion+1 up to schemaVersion applied, in order, so it picks
+	// up any ALTER TABLE/backfill a later version introduced.
 	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {
 			return fmt.Errorf("init schema: %w", err)
 		}
 	}
+	for v := storedVersion + 1; v <= schemaVersion; v++ {
+		for _, stmt := range migrations[v] {
+			if _, err := tx.Exec(stmt); err != nil {
+				return fmt.Errorf("migrate schema to version %d: %w", v, err)
+			}
+		}
+	}
 
-	if _, err := tx.Exec(
-		`INSERT INTO schema_meta(key, value) VALUES('version', ?)
-		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-		schemaVersion,
-	); err != nil {
-		return fmt.Errorf("record schema version: %w", err)
+	if storedVersion != schemaVersion {
+		if _, err := tx.Exec(
+			`INSERT INTO schema_meta(key, value) VALUES('version', ?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+			strconv.Itoa(schemaVersion),
+		); err != nil {
+			return fmt.Errorf("record schema version: %w", err)
+		}
 	}
 
 	return tx.Commit()

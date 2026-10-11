@@ -27,9 +27,25 @@ func key(kind string, port int, proto string) string {
 	return fmt.Sprintf("%s|%d|%s", kind, port, proto)
 }
 
+// portProto identifies a tracked port regardless of event kind.
+type portProto struct {
+	Port  int
+	Proto string
+}
+
 // Reconcile compares the given observations against the asset's expected
 // state, updates the event table accordingly, and returns a summary of
 // what happened. It is called once per saved scan.
+//
+// Every event kind - NEW_PORT, PORT_CLOSED, SERVICE_CHANGED,
+// SERVICE_DISAPPEARED, EXPECTED_SERVICE_MISSING alike - goes through
+// exactly the same two-scan pending -> confirmed rule, with no shortcuts:
+// a condition must be observed on two consecutive scans before it is
+// confirmed drift, and a "filtered" or "timeout" reading never counts as
+// an observation of anything for this purpose (see internal/diff's
+// Compute, and the PORT_CLOSED derivation below, for where that's
+// enforced). This is what keeps a transient scan failure from ever
+// producing a false confirmed-drift result.
 func Reconcile(st *storage.Store, assetID int64, observations []storage.Observation) (Summary, error) {
 	var summary Summary
 
@@ -54,7 +70,58 @@ func Reconcile(st *storage.Store, assetID int64, observations []storage.Observat
 		activeByKey[key(e.Kind, e.Port, e.Proto)] = e
 	}
 
-	// 1. Advance or create an event for every current candidate.
+	// PORT_CLOSED cannot be computed by the pure internal/diff package
+	// from observations and expected state alone: "closed" is only
+	// interesting in contrast to a port's own event history (specifically,
+	// whether it was ever flagged NEW_PORT - an unexpected, previously-open
+	// exposure PortPeek is actively tracking), not against a user-declared
+	// baseline. It is re-derived fresh here, every scan, as a candidate
+	// with exactly the same property every other candidate has: it fires
+	// every scan the underlying condition still holds (the port stays
+	// definitively closed) and is simply absent the moment it doesn't -
+	// which is what lets it flow through the exact same generic
+	// pending -> confirmed -> resolved machinery below as every other
+	// kind, with no special-casing, and the exact same two-scan rule.
+	//
+	// It is derived once per tracked (port, proto) - not once per active
+	// event referencing that port - so a port that currently has both an
+	// active NEW_PORT event (not yet resolved) and an active PORT_CLOSED
+	// event (still pending its own confirmation) never produces two
+	// competing candidates in the same call.
+	//
+	// A NEW_PORT event only starts tracking for PORT_CLOSED purposes once
+	// it is itself CONFIRMED - a still-pending, never-confirmed NEW_PORT
+	// is just a one-off blip, not a tracked exposure; if it disappears
+	// before its own confirmation, step 3 below cancels it outright, the
+	// same as any other never-confirmed finding, with no PORT_CLOSED
+	// event ever created for it. A PORT_CLOSED event, once it exists, is
+	// tracked regardless of its own pending/confirmed status, so it keeps
+	// being re-evaluated (touched, confirmed, or cancelled) every scan
+	// until it is resolved one way or the other.
+	tracked := make(map[portProto]bool)
+	for _, ev := range active {
+		if (ev.Kind == storage.EventNewPort && ev.Status == storage.StatusConfirmed) || ev.Kind == storage.EventPortClosed {
+			tracked[portProto{ev.Port, ev.Proto}] = true
+		}
+	}
+	for pp := range tracked {
+		obs, scanned := obsByPort[pp.Port]
+		if !scanned || obs.Proto != pp.Proto || obs.State != storage.StateClosed {
+			continue
+		}
+		candidates = append(candidates, diff.Candidate{
+			Kind:  storage.EventPortClosed,
+			Port:  pp.Port,
+			Proto: pp.Proto,
+			Details: fmt.Sprintf(
+				"port %d/%s, previously an active (confirmed or pending-confirmation) exposure, is now definitively closed (connection refused)",
+				pp.Port, pp.Proto,
+			),
+		})
+	}
+
+	// 1. Advance or create an event for every current candidate -
+	// including the derived PORT_CLOSED ones computed above.
 	for _, c := range candidates {
 		ck := key(c.Kind, c.Port, c.Proto)
 		if existing, ok := activeByKey[ck]; ok {
@@ -84,31 +151,58 @@ func Reconcile(st *storage.Store, assetID int64, observations []storage.Observat
 		summary.NewlyPending = append(summary.NewlyPending, created)
 	}
 
-	// 2. Everything left in activeByKey had no matching candidate this
-	// scan. Only act on it if this scan actually covered that port -
-	// otherwise we simply don't know anything new and leave it alone.
-	for _, ev := range activeByKey {
-		if _, scanned := obsByPort[ev.Port]; !scanned {
+	// 2. Once a derived PORT_CLOSED event reaches confirmed status (its
+	// own two-scan rule satisfied, same as above), the NEW_PORT exposure
+	// it closes out is done: resolve it. This is checked by re-reading
+	// current state rather than relying on anything computed above, so it
+	// is correct whether PORT_CLOSED was *just* confirmed this call or
+	// was already confirmed by an earlier scan (e.g. if a prior run
+	// failed to resolve it for some reason) - it is naturally a no-op
+	// once NEW_PORT is already resolved, since ListActiveEvents/
+	// FindActiveEvent simply won't find it any more.
+	for pp := range tracked {
+		pcEvent, err := st.FindActiveEvent(assetID, storage.EventPortClosed, pp.Port, pp.Proto)
+		if err != nil || pcEvent.Status != storage.StatusConfirmed {
 			continue
 		}
+		npEvent, err := st.FindActiveEvent(assetID, storage.EventNewPort, pp.Port, pp.Proto)
+		if err != nil {
+			continue
+		}
+		resolved, err := st.SetEventStatus(npEvent.ID, storage.StatusResolved)
+		if err != nil {
+			return summary, fmt.Errorf("resolve event %d: %w", npEvent.ID, err)
+		}
+		summary.Resolved = append(summary.Resolved, resolved)
+		delete(activeByKey, key(npEvent.Kind, npEvent.Port, npEvent.Proto))
+	}
 
+	// 3. Everything left in activeByKey had no matching candidate this
+	// scan. Only act on it if this scan produced a *definitive* result
+	// for that port:
+	//   - "open": whatever drift this event represents is gone - resolve
+	//     it if confirmed, cancel it outright if it never got that far.
+	//   - "closed": a different candidate superseded it this round (e.g.
+	//     an expected port's SERVICE_CHANGED event, now that the port is
+	//     EXPECTED_SERVICE_MISSING instead) - same resolve/cancel rule.
+	//   - "filtered"/"timeout", or genuinely unscanned this round: no
+	//     reliable new information was gained about this port at all, so
+	//     nothing is touched, confirmed, resolved, or cancelled. This is
+	//     what prevents a transient scan failure from ever clearing - or
+	//     ever confirming - a finding by itself.
+	// A confirmed NEW_PORT event showing closed is deliberately excluded
+	// here even though "closed" is otherwise definitive: its resolution
+	// is owned exclusively by step 2 above, gated on PORT_CLOSED's own
+	// two-scan confirmation, not on a single closed reading.
+	for _, ev := range activeByKey {
+		obs, scanned := obsByPort[ev.Port]
+		if !scanned {
+			continue
+		}
+		if obs.State != storage.StateOpen && obs.State != storage.StateClosed {
+			continue
+		}
 		if ev.Kind == storage.EventNewPort && ev.Status == storage.StatusConfirmed {
-			details := fmt.Sprintf("previously confirmed open port %d/%s is no longer open", ev.Port, ev.Proto)
-			pc, err := st.CreateEvent(assetID, storage.EventPortClosed, ev.Port, ev.Proto, &details)
-			if err != nil {
-				return summary, fmt.Errorf("create PORT_CLOSED event: %w", err)
-			}
-			pc, err = st.SetEventStatus(pc.ID, storage.StatusConfirmed)
-			if err != nil {
-				return summary, fmt.Errorf("confirm PORT_CLOSED event: %w", err)
-			}
-			summary.NewlyConfirmed = append(summary.NewlyConfirmed, pc)
-
-			resolved, err := st.SetEventStatus(ev.ID, storage.StatusResolved)
-			if err != nil {
-				return summary, fmt.Errorf("resolve event %d: %w", ev.ID, err)
-			}
-			summary.Resolved = append(summary.Resolved, resolved)
 			continue
 		}
 
@@ -120,7 +214,6 @@ func Reconcile(st *storage.Store, assetID int64, observations []storage.Observat
 			continue
 		}
 
-		// Confirmed event whose condition is gone: resolved.
 		resolved, err := st.SetEventStatus(ev.ID, storage.StatusResolved)
 		if err != nil {
 			return summary, fmt.Errorf("resolve event %d: %w", ev.ID, err)

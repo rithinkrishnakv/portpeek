@@ -82,6 +82,20 @@ type ExpectedJSON struct {
 	Note       string `json:"note,omitempty"`
 }
 
+// BaselineResultJSON is `baseline --json`'s output: the ports whose
+// expected state was recorded or refreshed, the ports whose stale
+// expected-open entry was removed because they were definitively observed
+// closed in the scan baseline acted on, and the ports that were observed
+// closed and had no prior expected-open entry to remove, but whose active
+// drift events (if any - typically a confirmed PORT_CLOSED tracking an
+// exposure that was never formally baselined) were accepted anyway.
+type BaselineResultJSON struct {
+	Asset             string         `json:"asset"`
+	Baselined         []ExpectedJSON `json:"baselined"`
+	RemovedPorts      []int          `json:"removed_ports,omitempty"`
+	AcknowledgedPorts []int          `json:"acknowledged_ports,omitempty"`
+}
+
 type HistoryEntryJSON struct {
 	ScanID       int64             `json:"scan_id"`
 	StartedAt    string            `json:"started_at"`

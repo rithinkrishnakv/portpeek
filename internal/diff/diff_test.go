@@ -102,6 +102,76 @@ func TestComputeServiceDisappeared(t *testing.T) {
 	}
 }
 
+// --- Uncertain states (filtered/timeout) must never produce a candidate --
+//
+// filtered and timeout are PortPeek being honest that an attempt produced
+// no reliable information - never evidence that a port or service closed.
+// These are the pure-function-level regression tests for that rule; the
+// internal/events package has the corresponding end-to-end lifecycle
+// tests (a filtered/timeout reading must not confirm, cancel, or resolve
+// any event either).
+
+func TestComputeFilteredExpectedPortProducesNothing(t *testing.T) {
+	obs := []storage.Observation{
+		{Port: 22, Proto: "tcp", State: "filtered"},
+	}
+	expected := []storage.Expected{
+		{Port: 22, Proto: "tcp", State: "open", Service: strp("SSH")},
+	}
+	got := Compute(obs, expected)
+	if len(got) != 0 {
+		t.Fatalf("a filtered reading on an expected port must produce no candidate, got %+v", got)
+	}
+}
+
+func TestComputeTimeoutExpectedPortProducesNothing(t *testing.T) {
+	obs := []storage.Observation{
+		{Port: 22, Proto: "tcp", State: "timeout"},
+	}
+	expected := []storage.Expected{
+		{Port: 22, Proto: "tcp", State: "open", Service: strp("SSH")},
+	}
+	got := Compute(obs, expected)
+	if len(got) != 0 {
+		t.Fatalf("a timeout reading on an expected port must produce no candidate, got %+v", got)
+	}
+}
+
+func TestComputeFilteredUnexpectedPortProducesNothing(t *testing.T) {
+	// Not expected, and not a definitive open or closed reading either -
+	// must never be treated as a NEW_PORT (it isn't observed open) nor
+	// as anything else.
+	obs := []storage.Observation{
+		{Port: 31337, Proto: "tcp", State: "filtered"},
+	}
+	got := Compute(obs, nil)
+	if len(got) != 0 {
+		t.Fatalf("a filtered reading on an unexpected port must produce no candidate, got %+v", got)
+	}
+}
+
+func TestComputeTimeoutUnexpectedPortProducesNothing(t *testing.T) {
+	obs := []storage.Observation{
+		{Port: 31337, Proto: "tcp", State: "timeout"},
+	}
+	got := Compute(obs, nil)
+	if len(got) != 0 {
+		t.Fatalf("a timeout reading on an unexpected port must produce no candidate, got %+v", got)
+	}
+}
+
+func TestComputeClosedUnexpectedPortProducesNothing(t *testing.T) {
+	// A port that was never flagged as anything simply being closed is
+	// not news - there is nothing to report missing.
+	obs := []storage.Observation{
+		{Port: 31337, Proto: "tcp", State: "closed"},
+	}
+	got := Compute(obs, nil)
+	if len(got) != 0 {
+		t.Fatalf("a closed reading on an unexpected, never-flagged port must produce no candidate, got %+v", got)
+	}
+}
+
 // TestComputeBaselinedUnknownServiceStaysConsistent is a regression test:
 // when a port was baselined while its service was unidentifiable (service
 // == "Unknown TCP service"), observing that same "unidentified" state

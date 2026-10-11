@@ -89,7 +89,7 @@ func Identify(ctx context.Context, host string, port int, timeout time.Duration)
 	tried := make(map[string]bool)
 
 	if hint, ok := portHints[port]; ok {
-		if res, matched := probeFamily(ctx, hint, host, port, timeout); matched {
+		if res, matched := safeProbeFamily(ctx, hint, host, port, timeout); matched {
 			return res
 		}
 		tried[hint] = true
@@ -100,16 +100,42 @@ func Identify(ctx context.Context, host string, port int, timeout time.Duration)
 			continue
 		}
 		tried[fam] = true
-		if res, matched := probeFamily(ctx, fam, host, port, timeout); matched {
+		if res, matched := safeProbeFamily(ctx, fam, host, port, timeout); matched {
 			return res
 		}
 	}
 
-	if res, matched := genericBannerProbe(ctx, host, port, timeout); matched {
+	if res, matched := safeGenericBannerProbe(ctx, host, port, timeout); matched {
 		return res
 	}
 
 	return unknown("no identifying response received; service accepted a TCP connection but sent no recognizable banner")
+}
+
+// safeProbeFamily and safeGenericBannerProbe are panic-recovery boundaries
+// around every individual probe. Every probe parses bytes volunteered by
+// whatever is listening on the far end of the connection - untrusted,
+// arbitrary, potentially malformed or deliberately hostile input. A
+// defensive bug in any one probe's parsing (now or added later) must never
+// take down the whole scan; a recovered panic is treated exactly like an
+// ordinary "no match", and Identify simply moves on to the next family or
+// the generic fallback, the same as it would for any other non-match.
+func safeProbeFamily(ctx context.Context, family, host string, port int, timeout time.Duration) (res Result, matched bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			res, matched = Result{}, false
+		}
+	}()
+	return probeFamily(ctx, family, host, port, timeout)
+}
+
+func safeGenericBannerProbe(ctx context.Context, host string, port int, timeout time.Duration) (res Result, matched bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			res, matched = Result{}, false
+		}
+	}()
+	return genericBannerProbe(ctx, host, port, timeout)
 }
 
 func probeFamily(ctx context.Context, family, host string, port int, timeout time.Duration) (Result, bool) {

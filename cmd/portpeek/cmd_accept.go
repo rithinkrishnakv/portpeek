@@ -42,18 +42,53 @@ func cmdAccept(args []string) int {
 		return ExitError
 	}
 
-	// Pull the most recently observed service for this port, if any, so
-	// the baseline records what was actually seen rather than guessing.
+	// Pull the most recently observed state and service for this port, if
+	// any, so accept records what was actually seen rather than guessing -
+	// and, critically, so it can tell a currently-*closed* port apart from
+	// an open (or never-scanned/uncertain) one. Blindly recording every
+	// accepted port as "expected open" regardless of its real state would
+	// be wrong for a port the user is accepting as closed (e.g. one with
+	// an active PORT_CLOSED event): it would immediately create a brand
+	// new, contradictory EXPECTED_SERVICE_MISSING finding on the very next
+	// scan for the exact state the user just accepted - a duplicate alert
+	// for something already acknowledged.
+	var state string
 	var service *string
 	if latest, err := st.LatestScan(asset.ID); err == nil {
 		if obs, err := st.GetObservations(latest.ID); err == nil {
 			for _, o := range obs {
 				if o.Port == port && o.Proto == "tcp" {
+					state = o.State
 					service = o.Service
 					break
 				}
 			}
 		}
+	}
+
+	if state == storage.StateClosed {
+		// The port is definitively closed: accepting it means removing
+		// any stale expected-open entry (if one exists) rather than
+		// creating a contradictory expected-open one, and clearing every
+		// active event for the port (PORT_CLOSED above all) in the same
+		// atomic step - exactly the same state-aware, transactional path
+		// `baseline` uses for a closed port with an existing expectation.
+		if _, err := st.ApplyBaseline(asset.ID, []storage.BaselineUpdate{
+			{Port: port, Proto: "tcp", Remove: true},
+		}); err != nil {
+			errorf("accept port %d: %v", port, err)
+			return ExitError
+		}
+		if *jsonOut {
+			return writeJSONOrErr(struct {
+				Port   int    `json:"port"`
+				State  string `json:"state"`
+				Note   string `json:"note,omitempty"`
+				Status string `json:"status"`
+			}{Port: port, State: "closed", Status: "accepted"})
+		}
+		fmt.Printf("%d/tcp is now accepted as closed on %q; any active drift for it is cleared.\n", port, label)
+		return ExitClean
 	}
 
 	var notePtr *string
@@ -67,12 +102,14 @@ func cmdAccept(args []string) int {
 		return ExitError
 	}
 
-	for _, kind := range []string{
-		storage.EventNewPort,
-		storage.EventServiceChanged,
-		storage.EventServiceDisappeared,
-		storage.EventExpectedServiceMissing,
-	} {
+	// Accept any other active event of any kind for this port - not just
+	// NEW_PORT - so approving it as expected-open also clears, say, a
+	// still-active SERVICE_CHANGED or EXPECTED_SERVICE_MISSING event for
+	// the same port in one step. (PORT_CLOSED is included for
+	// completeness/symmetry with `baseline`, though in practice a port
+	// reaching this branch was just observed open, so it won't normally
+	// have one active.)
+	for _, kind := range storage.AllEventKinds {
 		if active, err := st.FindActiveEvent(asset.ID, kind, port, "tcp"); err == nil {
 			if _, err := st.SetEventStatus(active.ID, storage.StatusAccepted); err != nil {
 				errorf("update event: %v", err)

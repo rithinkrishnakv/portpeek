@@ -46,16 +46,92 @@ scan. If the condition disappears before that second confirmation, the
 pending event is deleted outright — not resolved, not left behind with a
 "never mind" status, just gone, because it was never real to begin with.
 
-This creates one deliberate asymmetry: `PORT_CLOSED` is generated already
-`confirmed`, skipping its own pending step. That's not an inconsistency —
-it's because a `PORT_CLOSED` event is, by construction, derived from two
-already-confirmed data points: a port that was *confirmed open* (meaning
-it already survived its own two-scan test) and a fresh scan showing it's
-no longer open. Making `PORT_CLOSED` go through its own two-scan
-confirmation on top of that would mean a confirmed exposure could linger
-for two more scans after it's actually gone, which is the wrong failure
-mode for a security-relevant tool: better to report a closure promptly
-than to stay silent about one.
+**Every event kind is held to exactly the same rule, including
+`PORT_CLOSED` — there is no shortcut.** An earlier version of PortPeek had
+`PORT_CLOSED` born already `confirmed`, on the theory that it's derived
+from two already-confirmed data points (a port that survived its own
+two-scan test as open, plus one fresh "not open" reading) and so didn't
+need a confirmation cycle of its own. That reasoning had a real flaw: "not
+open" is not the same as "closed". A single `filtered` or `timeout`
+reading — a dropped packet, a slow host, a transient network hiccup, not
+an actual change on the target — was enough to immediately flip a
+confirmed `NEW_PORT` exposure straight to a confirmed `PORT_CLOSED` event
+and flip the CLI's exit code to 1, with no corroborating second reading at
+all. That's exactly the kind of false-positive confirmation this whole
+two-scan design exists to prevent.
+
+`PORT_CLOSED` is now held to the identical rule as everything else, with
+two changes on top: first, only a **definitively closed** reading (an
+actively refused connection) can ever start or advance it —
+`filtered`/`timeout` never count as evidence of anything and are silently
+ignored, exactly as if that port hadn't been scanned at all this round
+(see `internal/diff`'s `Compute` and `internal/events`'s `Reconcile` for
+where this is enforced). Second, because "closed" only means something in
+contrast to a port's own event history (there's no user-declared baseline
+to compare an *unexpected* open port against), `PORT_CLOSED` candidates
+can't be computed by the pure `internal/diff` package the way every other
+kind is — they're derived fresh each scan inside `internal/events`,
+directly from which ports currently have an active, confirmed `NEW_PORT`
+exposure (or an already in-progress `PORT_CLOSED` tracking cycle). Once
+derived, a `PORT_CLOSED` candidate flows through the exact same
+pending → confirmed machinery as any other kind. Only once `PORT_CLOSED`
+itself reaches `confirmed` — two consecutive, definitively-closed
+readings — is the original `NEW_PORT` event resolved. A `NEW_PORT` that
+was still merely *pending* (never confirmed as a real exposure to begin
+with) and then closes is simply cancelled outright, the same as any other
+unconfirmed finding that disappears before its own confirmation; no
+`PORT_CLOSED` event is created for it at all.
+
+The cost of this fix is that a genuine closure now takes one scan longer
+to surface than it used to (two closed readings instead of one). That's
+the correct trade: a tool whose "confirmed drift" can be produced by a
+single dropped packet is not trustworthy, and losing one scan interval of
+latency on a real closure is a far smaller cost than a security tool that
+cries wolf on ordinary network noise.
+
+## A confirmed event never resolves itself just by staying true
+
+Once a `PORT_CLOSED` event confirms and resolves its originating
+`NEW_PORT` event, `PORT_CLOSED` itself is deliberately left `confirmed` -
+not auto-resolved - for as long as the port keeps reading closed. This is
+not an oversight; it's the same rule every other event kind follows: a
+condition that is still true on a later scan simply keeps getting touched
+(its `scan_count` and `last_seen` advance), remaining active, confirmed
+drift until a human explicitly acts on it via `baseline` or `accept`.
+"Confirmed drift" exists specifically to mean "this needs your attention,"
+and a tool that silently stopped saying so once a condition became
+routine would defeat the purpose - `diff`/`scan`'s exit code 1 should
+never quietly go away on its own.
+
+That rule surfaced a real, related bug worth recording: `PORT_CLOSED`
+specifically tracks a port that was *never* formally baselined (an
+unexpected `NEW_PORT` exposure that later closed on its own) - by
+definition, such a port has no `expected` row to remove. `baseline`
+originally only swept a port's active events as a side effect of removing
+a stale `expected` row, so a never-baselined port's confirmed
+`PORT_CLOSED` event was simply unreachable by `baseline` - it had nothing
+to remove, so it touched nothing, so the event sat there confirmed
+forever with no bulk way to clear it. The fix: `baseline` now acts on
+every definitively-closed port it observes, whether or not it has an
+existing expectation to remove, reported separately as "removed" (had a
+stale entry) versus "acknowledged" (didn't, but its events were still
+cleared) - see `cmd_baseline.go` and the README's `baseline` section.
+
+The `accept` command had a sharper version of the same class of bug:
+`accept <port>` always recorded the port as expected-*open*, regardless
+of what the latest scan actually observed. Once `accept`'s event-sweep was
+widened to cover `PORT_CLOSED` as well (so a confirmed closure could be
+dismissed via `accept`, the same as `baseline`), accepting a *closed* port
+would simultaneously clear its `PORT_CLOSED` event and insert a
+contradictory expected-*open* row for a port that was, in fact, closed -
+producing a brand-new `EXPECTED_SERVICE_MISSING` finding on the very next
+scan for the exact state just accepted. The general lesson, same shape as
+the "Unknown TCP service" one below: **widening what a command cleans up
+without checking that its other side effects still make sense for every
+state that cleanup can apply to is how you manufacture a duplicate
+alert.** The fix made `accept` state-aware like `baseline`: a
+definitively-closed port gets its stale expectation removed, not a
+contradictory one created.
 
 ## The "Unknown TCP service" lesson
 

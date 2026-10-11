@@ -6,6 +6,27 @@ import (
 	"time"
 )
 
+// Observation state values. These mirror internal/scanner's State type
+// (as plain strings, since storage deliberately does not import scanner -
+// see the package doc comment on why observation source and state engine
+// stay decoupled) and are the complete, closed set of values
+// Observation.State can hold.
+//
+// The distinction between StateClosed and the two uncertain states
+// (StateFiltered, StateTimeout) matters a great deal to internal/diff and
+// internal/events: StateClosed is a *definitive* signal (the kernel
+// actively refused the connection - nothing is listening there).
+// StateFiltered and StateTimeout mean PortPeek simply could not get a
+// clear answer this attempt - a dropped packet, a transient network
+// hiccup, a slow host - and must never be treated as evidence that a
+// service has gone away.
+const (
+	StateOpen     = "open"
+	StateClosed   = "closed"
+	StateFiltered = "filtered"
+	StateTimeout  = "timeout"
+)
+
 // Scan is one invocation of `portpeek scan <asset>` that was persisted
 // (scans run with --no-save never produce one of these).
 type Scan struct {

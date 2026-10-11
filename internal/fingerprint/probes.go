@@ -66,12 +66,19 @@ func sshProbe(ctx context.Context, host string, port int, timeout time.Duration)
 
 	version := ""
 	// SSH-2.0-OpenSSH_9.6 -> "OpenSSH 9.6"
+	//
+	// The software/version field after the second "-" is mandatory per
+	// RFC 4253, but PortPeek must never assume a well-behaved remote
+	// peer: a malformed or truncated banner (e.g. "SSH-2.0-" with
+	// nothing after the final dash, or one trailing only whitespace)
+	// must degrade to "no version extracted", never panic. The banner
+	// itself is still captured as evidence either way.
 	parts := strings.SplitN(line, "-", 3)
 	if len(parts) == 3 {
-		software := parts[2]
-		software = strings.Fields(software)[0]
-		software = strings.ReplaceAll(software, "_", " ")
-		version = software
+		software := strings.TrimSpace(parts[2])
+		if fields := strings.Fields(software); len(fields) > 0 {
+			version = strings.ReplaceAll(fields[0], "_", " ")
+		}
 	}
 
 	return Result{
@@ -355,8 +362,21 @@ func trySimpleHTTPRequest(conn net.Conn, host string, timeout time.Duration) (st
 		if line == "" || err != nil {
 			break
 		}
-		if strings.HasPrefix(strings.ToLower(line), "server:") {
-			server = sanitize(strings.TrimSpace(line[len("server:"):]))
+		// Find the header's name/value separator in the *original*
+		// line and compare case-insensitively, rather than slicing the
+		// original by the byte-length of a lowercased literal: under
+		// full Unicode case folding a single character can lower into
+		// more bytes than it started as (e.g. certain accented
+		// uppercase letters), which would make a fixed-offset slice of
+		// a hostile, non-ASCII header line panic with an out-of-range
+		// index. A found colon index is always a valid bound for the
+		// string it was found in, so this can never panic.
+		idx := strings.IndexByte(line, ':')
+		if idx <= 0 {
+			continue
+		}
+		if strings.EqualFold(line[:idx], "server") {
+			server = sanitize(strings.TrimSpace(line[idx+1:]))
 			if len(server) > maxBannerLen {
 				server = server[:maxBannerLen]
 			}

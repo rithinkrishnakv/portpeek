@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
 
 permissions:
   contents: read
@@ -16,13 +16,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: ["1.21", "1.22"]
+        # The two currently-supported Go major releases (Go is supported
+        # until there are two newer major releases - see
+        # https://go.dev/doc/devel/release#policy). go.mod's declared
+        # minimum (see README's "Requires Go 1.21+") is lower than both of
+        # these, which is expected: CI tracks the current, maintained
+        # compiler versions going forward, not the oldest version the code
+        # happens to still build with.
+        go-version: ["1.26", "1.27"]
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
           cache: true
@@ -53,12 +60,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
-          go-version: "1.22"
+          go-version: "1.27"
           cache: true
 
       - name: Install staticcheck

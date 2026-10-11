@@ -178,7 +178,7 @@ script, and `examples/cron-check.sh` for running PortPeek unattended.
 | `add <label> <host>` | Register a new asset under a chosen label |
 | `list` | List registered assets |
 | `scan <asset>` | Scan an asset and record observations |
-| `baseline <asset>` | Accept *all* currently open ports as expected |
+| `baseline <asset>` | Accept the latest scan's observed state as expected |
 | `diff <asset>` | Compare the latest scan against expected state |
 | `accept <asset> <port>` | Approve a single port as expected |
 | `history <asset>` | Show scan history (optionally for one port) |
@@ -229,9 +229,55 @@ Flags:
 
 ### `baseline <asset>`
 
-Accepts every currently-open port from the asset's most recent scan as
-expected state, in bulk. Any active `NEW_PORT` events for those ports are
-marked accepted.
+Accepts the asset's most recent scan as the expected state, in bulk:
+
+- Every port the scan observed **open** becomes (or remains) expected-open,
+  recorded with whatever service was actually seen.
+- Every port the scan observed **definitively closed** (an actively refused
+  connection) that currently has a stale expected-open entry has that entry
+  removed — `baseline` is how you tell PortPeek "I know, that port is gone
+  on purpose, stop flagging it." A definitively-closed port with *no* prior
+  expectation (the common case for an unexpected exposure that was never
+  baselined in the first place) is instead simply acknowledged: there's no
+  stale entry to remove, but any active event about it — above all a
+  confirmed `PORT_CLOSED` — is still cleared.
+- A port the scan read as **filtered or timeout** is left entirely alone:
+  an inconclusive reading is never treated as evidence of anything, so any
+  existing expectation (or lack of one) for that port survives unchanged.
+- A port **outside the scanned port range** entirely is likewise left
+  untouched — baseline never reasons about a port it didn't just look at.
+
+Any active event (of any kind — `NEW_PORT`, `PORT_CLOSED`,
+`SERVICE_CHANGED`, `SERVICE_DISAPPEARED`, `EXPECTED_SERVICE_MISSING`) for
+an affected port is marked accepted at the same time, so a baseline run
+clears any drift it just resolved rather than leaving it to keep
+contributing to a confirmed-drift exit code. The whole update — every
+port's expected-state change plus every event acceptance — is applied as a
+single atomic transaction: a baseline run either fully succeeds or leaves
+the database exactly as it found it.
+
+`--json` prints an object (not a bare array):
+
+```json
+{
+  "asset": "demo-host",
+  "baselined": [
+    {"port": 2222, "protocol": "tcp", "state": "open", "service": "SSH", "accepted_at": "..."}
+  ],
+  "removed_ports": [9999],
+  "acknowledged_ports": [31337]
+}
+```
+
+`removed_ports` lists ports whose stale expected-open entry was just
+removed because this scan found them definitively closed. `acknowledged_ports`
+lists ports that were likewise found definitively closed, but had no
+expected-open entry to remove — a never-baselined `PORT_CLOSED` finding,
+most commonly — so their active event(s) were cleared without an
+accompanying expected-state change. Both are omitted when empty. (This is
+a breaking change from earlier `0.1.0` pre-releases,
+which printed `baselined` as a bare top-level array with no way to report
+removals.)
 
 ### `diff <asset>`
 
@@ -241,12 +287,36 @@ state. Sets the same [exit codes](#exit-codes) as `scan`.
 
 ### `accept <asset> <port>`
 
-Approves a single port as expected, with an optional note:
+Approves a single port's current state from the latest scan, with an
+optional note. Like `baseline`, it's state-aware:
 
-```console
-$ portpeek accept home-server 8080 --note "dev server, expected"
-8080/tcp is now expected on "home-server" (HTTP).
-```
+- If the port's latest reading is **open** (the common case - approving a
+  `NEW_PORT` finding), it's recorded as expected-open with the observed
+  service:
+
+  ```console
+  $ portpeek accept home-server 8080 --note "dev server, expected"
+  8080/tcp is now expected on "home-server" (HTTP).
+  ```
+
+- If the port's latest reading is **definitively closed** (e.g.
+  acknowledging a confirmed `PORT_CLOSED` finding for an exposure that was
+  never baselined), `accept` removes any stale expected-open entry instead
+  of creating one, and `--note` doesn't apply:
+
+  ```console
+  $ portpeek accept home-server 31337
+  31337/tcp is now accepted as closed on "home-server"; any active drift for it is cleared.
+  ```
+
+- If there's no scan yet, or the latest reading for that port is
+  filtered/timeout/unscanned, `accept` falls back to recording it as
+  expected-open on your say-so (the same as always) - this is the one case
+  where, unlike `baseline`, a direct single-port command takes your
+  explicit request at face value even without a fresh definitive reading.
+
+Either way, every active event for that port (of any kind) is cleared as
+part of the same step.
 
 Use this when you want to approve one specific finding without baselining
 everything else that's currently open.
@@ -283,10 +353,21 @@ Every scan's observations are compared against the asset's expected
 | Kind | Meaning |
 |---|---|
 | `NEW_PORT` | An open port with no matching expected entry |
-| `PORT_CLOSED` | A port that was confirmed expected-open is no longer open |
+| `PORT_CLOSED` | An unexpected exposure PortPeek confirmed via `NEW_PORT` has since closed (not baselined/accepted - see below) |
 | `SERVICE_CHANGED` | An expected port is still open, but a *different, identified* service now responds |
 | `SERVICE_DISAPPEARED` | An expected port's previously-identified service is no longer identifiable |
 | `EXPECTED_SERVICE_MISSING` | An expected-open port is no longer open at all |
+
+`PORT_CLOSED` and `EXPECTED_SERVICE_MISSING` cover the same underlying
+fact - a port is no longer open - for the two different cases a port can
+be in: `PORT_CLOSED` is for a port PortPeek flagged as an *unexpected*
+exposure (`NEW_PORT`) that was never formally approved via `baseline` or
+`accept`; `EXPECTED_SERVICE_MISSING` is for a port that *was* approved and
+is now missing. Once `PORT_CLOSED` itself confirms (its own two-scan
+rule), the original `NEW_PORT` event is automatically resolved - but
+`PORT_CLOSED` stays active (confirmed) in its own right, the same as any
+other confirmed finding, until you explicitly acknowledge it via
+`baseline` or `accept`.
 
 **No single scan declares confirmed drift.** A new finding starts
 `pending`. Only if the *same* finding appears again on the next scan does
@@ -456,13 +537,16 @@ Documented honestly, not as surprises:
   PortPeek doesn't sweep a subnet on its own in this release.
 - **A curated default port list (~30 ports), not an exhaustive one.** Pass
   `--ports` explicitly for broader coverage.
-- **`baseline` doesn't prune stale expected-state entries.** If a port was
-  baselined as expected and then permanently removed from your
-  infrastructure, its `expected` row remains (and a subsequent scan not
-  covering that port simply won't comment on it, per the "never reason
-  about unscanned ports" rule — see `docs/design.md`). There's currently
-  no command to explicitly un-baseline a port short of `remove`-ing and
-  re-`add`-ing the asset.
+- **`baseline` only prunes stale entries it has definitive evidence for.**
+  Re-running `baseline` removes an expected-open entry for a port the
+  latest scan observed definitively closed. If a port was baselined as
+  expected and then taken out of the scanned `--ports` range entirely (or
+  the host/port only ever reads filtered/timeout), its stale `expected`
+  row is left alone — PortPeek never prunes an expectation on anything
+  less than a definitive "closed" reading in the same scan. For a port
+  like that, remove it explicitly (there's currently no single-port
+  "un-baseline" command short of `remove`-ing and re-`add`-ing the asset,
+  or editing the database directly).
 - **Single-connection SQLite access.** Fine for a single-user CLI tool;
   not designed for concurrent multi-process writers against the same
   database file.

@@ -30,7 +30,7 @@ type Candidate struct {
 //
 // Rules:
 //   - An open port with no matching expected entry -> NEW_PORT.
-//   - An expected port no longer observed open -> EXPECTED_SERVICE_MISSING.
+//   - An expected port definitively observed closed -> EXPECTED_SERVICE_MISSING.
 //   - An expected port still open but reporting a different identified
 //     service -> SERVICE_CHANGED.
 //   - An expected port still open, with an expected service that used to
@@ -40,6 +40,18 @@ type Candidate struct {
 // Ports present in `expected` but absent from `observations` entirely
 // (i.e. not covered by this scan's port spec) also produce nothing - we
 // never report drift for something we did not actually look at.
+//
+// Critically, a "filtered" or "timeout" observation is never treated as
+// evidence of anything: it is PortPeek being honest that this attempt
+// produced no reliable information, not a port being closed or a service
+// going away. Both are explicitly excluded here, in exactly the same way
+// an unscanned port is excluded - producing no candidate at all, for an
+// unexpected port or an expected one alike. This is what keeps a single
+// transient network hiccup from ever being treated as drift: a
+// filtered/timeout read simply contributes no information this round, and
+// whatever was already known (or already pending/confirmed - see
+// internal/events) is left exactly as it was until a scan produces a
+// definitive open or closed result.
 func Compute(observations []storage.Observation, expected []storage.Expected) []Candidate {
 	expByPort := make(map[int]storage.Expected, len(expected))
 	for _, e := range expected {
@@ -51,8 +63,9 @@ func Compute(observations []storage.Observation, expected []storage.Expected) []
 	for _, obs := range observations {
 		exp, isExpected := expByPort[obs.Port]
 
-		if !isExpected {
-			if obs.State == "open" {
+		switch obs.State {
+		case storage.StateOpen:
+			if !isExpected {
 				svc := valueOr(obs.Service, "an unidentified service")
 				out = append(out, Candidate{
 					Kind:  storage.EventNewPort,
@@ -62,51 +75,60 @@ func Compute(observations []storage.Observation, expected []storage.Expected) []
 						"port is open and not present in the expected baseline (observed service: %s)", svc,
 					),
 				})
+				continue
 			}
-			continue
-		}
 
-		// Port is expected.
-		if obs.State != "open" {
-			out = append(out, Candidate{
-				Kind:  storage.EventExpectedServiceMissing,
-				Port:  obs.Port,
-				Proto: obs.Proto,
-				Details: fmt.Sprintf(
-					"expected open (service: %s) but observed state is %q", valueOr(exp.Service, "unspecified"), obs.State,
-				),
-			})
-			continue
-		}
+			expSvc := valueOr(exp.Service, "")
+			obsSvc := valueOr(obs.Service, "")
+			expKnown := isKnownService(expSvc)
+			obsKnown := isKnownService(obsSvc)
 
-		expSvc := valueOr(exp.Service, "")
-		obsSvc := valueOr(obs.Service, "")
-		expKnown := isKnownService(expSvc)
-		obsKnown := isKnownService(obsSvc)
+			switch {
+			case expKnown && obsKnown && !strings.EqualFold(expSvc, obsSvc):
+				out = append(out, Candidate{
+					Kind:  storage.EventServiceChanged,
+					Port:  obs.Port,
+					Proto: obs.Proto,
+					Details: fmt.Sprintf(
+						"expected service %q, observed %q", expSvc, obsSvc,
+					),
+				})
+			case expKnown && !obsKnown:
+				out = append(out, Candidate{
+					Kind:  storage.EventServiceDisappeared,
+					Port:  obs.Port,
+					Proto: obs.Proto,
+					Details: fmt.Sprintf(
+						"expected service %q is no longer identifiable on this port", expSvc,
+					),
+				})
+			}
+			// Otherwise - including the case where the baseline itself
+			// was never identified (expected "Unknown TCP service" and
+			// still is) - this is consistent with baseline: no candidate.
 
-		switch {
-		case expKnown && obsKnown && !strings.EqualFold(expSvc, obsSvc):
-			out = append(out, Candidate{
-				Kind:  storage.EventServiceChanged,
-				Port:  obs.Port,
-				Proto: obs.Proto,
-				Details: fmt.Sprintf(
-					"expected service %q, observed %q", expSvc, obsSvc,
-				),
-			})
-		case expKnown && !obsKnown:
-			out = append(out, Candidate{
-				Kind:  storage.EventServiceDisappeared,
-				Port:  obs.Port,
-				Proto: obs.Proto,
-				Details: fmt.Sprintf(
-					"expected service %q is no longer identifiable on this port", expSvc,
-				),
-			})
+		case storage.StateClosed:
+			// A definitive signal (connection actively refused). Only
+			// meaningful for a port that was expected open; an
+			// unexpected port simply being closed is not news - it was
+			// never flagged as anything in the first place.
+			if isExpected {
+				out = append(out, Candidate{
+					Kind:  storage.EventExpectedServiceMissing,
+					Port:  obs.Port,
+					Proto: obs.Proto,
+					Details: fmt.Sprintf(
+						"expected open (service: %s) but the port is now definitively closed (connection refused)",
+						valueOr(exp.Service, "unspecified"),
+					),
+				})
+			}
+
+		default:
+			// storage.StateFiltered, storage.StateTimeout, or any other
+			// non-definitive result: no information gained, no candidate
+			// produced, for either an expected or unexpected port.
 		}
-		// Otherwise - including the case where the baseline itself was
-		// never identified (expected "Unknown TCP service" and still is)
-		// - this is consistent with baseline: no candidate.
 	}
 
 	return out
