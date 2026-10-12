@@ -1,3 +1,6 @@
+<p align="center">
+  <img src="assets/portpeek-banner.png" alt="PortPeek — local-first network exposure changelog" width="100%">
+</p>
 # PortPeek
 
 **A local-first network exposure changelog.**
