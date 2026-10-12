@@ -1,7 +1,15 @@
 <p align="center">
   <img src="assets/portpeek-banner.png" alt="PortPeek — local-first network exposure changelog" width="100%">
 </p>
-# PortPeek
+
+<p align="center">
+  <a href="LICENSE">
+    <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-00BFAE?style=for-the-badge">
+  </a>
+  <img alt="Go 1.21+" src="https://img.shields.io/badge/Go-1.21%2B-00D4C7?style=for-the-badge">
+  <img alt="Version v0.1.0" src="https://img.shields.io/badge/version-v0.1.0-18D66B?style=for-the-badge">
+</p>
+
 
 **A local-first network exposure changelog.**
 
