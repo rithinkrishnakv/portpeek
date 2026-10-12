@@ -281,11 +281,10 @@ Two design choices worth calling out:
   that counts as "safe" for a given user's network - so it stays on the
   confirm-required side rather than guessing.
 - **A hostname that resolves to a mix of private and public addresses is
-  treated as public overall**, not partially allowed. PortPeek's scanner
-  connects to whatever address the dialer actually resolves at scan time,
-  the same resolution `safety.Classify` performs - it cannot assume that
-  will be the private one, so the conservative answer is the only safe
-  one.
+  treated as public overall**, not partially allowed. The address
+  actually scanned (see "DNS resolution consistency" below) is one
+  specific address from that resolution - it cannot assume that one will
+  be the private one, so the conservative answer is the only safe one.
 
 Confirmation is two-tiered rather than a single global switch: `scan
 --confirm-public-target` is a one-off, per-invocation bypass, while
@@ -297,6 +296,55 @@ existing call sites). Both are deliberately opt-in and scoped to a single
 asset or a single invocation - there is no "disable this check globally"
 flag, since the entire point is to require a conscious decision each time
 a target turns out not to be private.
+
+### DNS resolution consistency
+
+The safety gate above only works if the address it classifies is the
+address that actually gets scanned. The first version of this guard
+didn't guarantee that: `cmd scan` resolved and classified `asset.Host`
+once to decide allow/refuse, then handed the *original hostname* straight
+to `scanner.Scan`, which resolved it again on its own - and
+`fingerprint.Identify` resolved it a third time, independently, for every
+open port it fingerprinted. A hostname's DNS answer is not guaranteed to
+stay the same between any two of those lookups: a short TTL, round-robin
+records, or an actively hostile DNS server racing the two resolutions
+(classic TOCTOU/DNS-rebinding) could let a target that classified as
+private at the safety check actually be scanned at a different, possibly
+public, address moments later - defeating the guard entirely - or simply
+mean the thing fingerprinted wasn't the thing classified.
+
+The fix is to resolve exactly once per `scan` invocation and pin
+everything else to that result: `cmdScan` calls `safety.Classify` a
+single time, and the resulting address - not `asset.Host` - is what
+`scanner.Scan` dials and what `fingerprint.Identify` connects to for
+every port. Both functions still take a hostname-shaped parameter (for
+backward-compatible callers and for the plain case of an IP-literal
+asset, where resolution is a no-op parse anyway), but production code now
+always passes the one address that was already classified.
+
+This did, however, run into a real constraint: `fingerprint.Identify`'s
+HTTP and HTTPS probes need the *original hostname*, not the resolved IP,
+for the `Host:` header and the TLS SNI `ServerName` - a virtual-hosted
+service keyed on hostname would otherwise be misidentified (or, worse,
+answer with the wrong site entirely) if probed by IP alone. So `Identify`
+takes two separate parameters rather than one: `dialAddr` (the pinned,
+already-resolved address every connection is actually made to) and
+`sniHost` (the original hostname, used only for Host-header/SNI content,
+never for dialing). `scanner.Scan` only ever needed the dial address to
+begin with, so it keeps its single `host` parameter unchanged - callers
+that have already resolved and classified a target now just pass that
+resolved address there instead of a hostname.
+
+One deliberate trade-off: pinning to a single resolved address means a
+hostname that resolves to multiple addresses is scanned at only one of
+them (the first `safety.Classify` returns) for a given invocation, rather
+than letting the OS resolver's own multi-address fallback try others if
+the first is unreachable. That resilience was never a documented
+behavior to begin with, and giving it up is the correct trade for
+guaranteeing the address classified is the address scanned - an
+unreachable address simply reads as `filtered`/`timeout`, the same
+honest, non-committal result PortPeek already gives for any other probe
+failure.
 
 ## Exit codes are a stable contract
 

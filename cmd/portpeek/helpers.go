@@ -102,41 +102,78 @@ func assetToJSON(a storage.Asset) output.AssetJSON {
 	}
 }
 
-// checkPublicTargetAllowed is the public-target scan guard shared by every
-// command that actually dials a target (currently just `scan`, for both
-// its persisted and --no-save paths). It resolves and classifies
-// asset.Host and, if any resolved address is not private/loopback,
-// refuses to proceed unless the caller has explicitly allowed it - either
-// as a standing, persistent opt-out on the asset itself
-// (asset.AllowPublicTarget, set via `add --allow-public-target`), or for
-// this one invocation only (confirmFlag, set via `scan
-// --confirm-public-target`). On refusal it prints an explanatory error
-// itself and returns false; callers should return ExitError in that case.
+// classifyFunc resolves and classifies a scan target's address(es) - see
+// internal/safety.Classify, which this defaults to. It exists purely as a
+// package-level indirection so tests can substitute a fake, deterministic
+// classifier (no real DNS lookups or outbound network access, and
+// deterministic resolved addresses for the DNS-resolution-consistency
+// regression tests - see cmd_public_target_test.go) when testing
+// resolveScanTarget's and cmd_scan's decision/wiring logic in isolation.
+// It is never overridden or made configurable at runtime by any flag,
+// environment variable, or user input - the production `portpeek` binary
+// always uses safety.Classify - so this changes nothing about production
+// behavior, only what a test build can substitute.
+var classifyFunc = safety.Classify
+
+// resolveScanTarget resolves and classifies asset.Host exactly once (via
+// classifyFunc, which is safety.Classify in production) and returns the
+// single literal address every connection made during this scan
+// invocation must actually be dialed to - scanner.Scan and
+// fingerprint.Identify are both given this same resolved dialAddr rather
+// than asset.Host, so neither re-resolves the hostname on its own.
 //
-// This is deliberately a check performed immediately before scanning,
-// using the same resolver behavior the scanner's own dialer will see
-// moments later - not a one-time check at `add` time - because a
-// hostname's resolution can change between when an asset was added and
-// when it is scanned.
-func checkPublicTargetAllowed(ctx context.Context, asset storage.Asset, confirmFlag bool) bool {
-	if asset.AllowPublicTarget || confirmFlag {
-		return true
-	}
-
-	c, err := safety.Classify(ctx, asset.Host)
+// This single-resolution design is what keeps the address actually
+// scanned consistent with the address the public-target safety gate
+// evaluated: resolving separately at classify-time and dial-time (the
+// previous behavior - this function decided allow/refuse, then handed the
+// original hostname to the scanner, which resolved it again itself) left
+// a window where a hostname's DNS answer could differ between the two
+// resolutions, letting a target classified private at the first
+// resolution actually be scanned at a different, possibly public, address
+// moments later (or vice versa) - a classic TOCTOU/DNS-rebinding gap. See
+// docs/design.md's "DNS resolution consistency" section.
+//
+// The gate (asset.AllowPublicTarget, confirmFlag, and the classification's
+// AllPrivate) is applied the same way as before: refuse unless the
+// resolved address(es) are all private/loopback, or the caller has
+// explicitly allowed it - either as a standing, persistent opt-out on the
+// asset itself (asset.AllowPublicTarget, set via `add
+// --allow-public-target`), or for this one invocation only (confirmFlag,
+// set via `scan --confirm-public-target`). Resolution happens regardless
+// of whether the gate would bypass the check, because every scan needs a
+// single, pinned dial address, not just gated ones.
+//
+// On refusal (including a resolution failure - with no resolved address
+// there is no address to safely pin a dial to) it prints an explanatory
+// error itself and returns ok=false; callers should return ExitError in
+// that case.
+func resolveScanTarget(ctx context.Context, asset storage.Asset, confirmFlag bool) (dialAddr string, ok bool) {
+	c, err := classifyFunc(ctx, asset.Host)
 	if err != nil {
-		errorf("resolve target %q for safety check: %v", asset.Host, err)
-		return false
+		errorf("resolve target %q: %v", asset.Host, err)
+		return "", false
 	}
-	if c.AllPrivate {
-		return true
+	if len(c.Addrs) == 0 {
+		errorf("resolve target %q: no addresses returned", asset.Host)
+		return "", false
 	}
 
-	errorf("asset %q (%s) resolves to a non-private address and scanning it has not been confirmed", asset.Label, asset.Host)
-	fmt.Fprintln(os.Stderr, "portpeek: refusing to scan a public target without explicit confirmation, to avoid accidentally scanning hosts you don't control.")
-	fmt.Fprintln(os.Stderr, "portpeek: to scan this target once, re-run with --confirm-public-target.")
-	fmt.Fprintf(os.Stderr, "portpeek: to always allow this asset, run: portpeek allow-public-target %s\n", asset.Label)
-	return false
+	if !asset.AllowPublicTarget && !confirmFlag && !c.AllPrivate {
+		errorf("asset %q (%s) resolves to a non-private address and scanning it has not been confirmed", asset.Label, asset.Host)
+		fmt.Fprintln(os.Stderr, "portpeek: refusing to scan a public target without explicit confirmation, to avoid accidentally scanning hosts you don't control.")
+		fmt.Fprintln(os.Stderr, "portpeek: to scan this target once, re-run with --confirm-public-target.")
+		fmt.Fprintf(os.Stderr, "portpeek: to always allow this asset, run: portpeek allow-public-target %s\n", asset.Label)
+		return "", false
+	}
+
+	// Addrs[0] is the first address classifyFunc resolved - the same
+	// address (and the same single resolution call) that just decided
+	// AllPrivate above, so the gate's decision and the dial target can
+	// never disagree. For an asset whose Host is already an IP literal,
+	// Classify performs no network resolution at all (a pure parse), so
+	// this is exactly asset.Host, unchanged - the single-resolution
+	// behavior only matters for hostname-based assets.
+	return c.Addrs[0].String(), true
 }
 
 func expectedToJSON(e storage.Expected) output.ExpectedJSON {

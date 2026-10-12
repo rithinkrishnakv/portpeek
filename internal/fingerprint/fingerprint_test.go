@@ -45,7 +45,7 @@ func TestIdentifySSHBanner(t *testing.T) {
 	defer ln.Close()
 	go serveBanner(ln, []byte("SSH-2.0-OpenSSH_9.6\r\n"))
 
-	res := Identify(context.Background(), "127.0.0.1", port, testTimeout)
+	res := Identify(context.Background(), "127.0.0.1", "127.0.0.1", port, testTimeout)
 	if res.Service != "SSH" {
 		t.Fatalf("expected SSH, got %q (evidence=%q)", res.Service, res.Evidence)
 	}
@@ -62,7 +62,7 @@ func TestIdentifyFTPBanner(t *testing.T) {
 	defer ln.Close()
 	go serveBanner(ln, []byte("220 Welcome to test FTP\r\n"))
 
-	res := Identify(context.Background(), "127.0.0.1", port, testTimeout)
+	res := Identify(context.Background(), "127.0.0.1", "127.0.0.1", port, testTimeout)
 	if res.Service != "FTP" {
 		t.Fatalf("expected FTP, got %q", res.Service)
 	}
@@ -73,7 +73,7 @@ func TestIdentifySMTPBanner(t *testing.T) {
 	defer ln.Close()
 	go serveBanner(ln, []byte("220 mail.example.com ESMTP Postfix\r\n"))
 
-	res := Identify(context.Background(), "127.0.0.1", port, testTimeout)
+	res := Identify(context.Background(), "127.0.0.1", "127.0.0.1", port, testTimeout)
 	if res.Service != "SMTP" {
 		t.Fatalf("expected SMTP, got %q", res.Service)
 	}
@@ -159,7 +159,7 @@ func TestIdentifyHTTP(t *testing.T) {
 		}
 	}()
 
-	res := Identify(context.Background(), "127.0.0.1", port, testTimeout)
+	res := Identify(context.Background(), "127.0.0.1", "127.0.0.1", port, testTimeout)
 	if res.Service != "HTTP" {
 		t.Fatalf("expected HTTP, got %q", res.Service)
 	}
@@ -269,7 +269,7 @@ func TestIdentifyUnknownService(t *testing.T) {
 		}
 	}()
 
-	res := Identify(context.Background(), "127.0.0.1", port, testTimeout)
+	res := Identify(context.Background(), "127.0.0.1", "127.0.0.1", port, testTimeout)
 	if res.Service != "Unknown TCP service" {
 		t.Fatalf("expected Unknown TCP service, got %q", res.Service)
 	}
@@ -283,7 +283,7 @@ func TestIdentifyGenericBanner(t *testing.T) {
 	defer ln.Close()
 	go serveBanner(ln, []byte("WEIRD-PROTOCOL/1.0 hello\n"))
 
-	res := Identify(context.Background(), "127.0.0.1", port, testTimeout)
+	res := Identify(context.Background(), "127.0.0.1", "127.0.0.1", port, testTimeout)
 	if res.Service != "Unknown TCP service" {
 		t.Fatalf("expected Unknown TCP service, got %q", res.Service)
 	}
@@ -341,7 +341,7 @@ func TestIdentifySSHMalformedBannersDoNotPanic(t *testing.T) {
 
 			var res Result
 			mustNotPanic(t, "Identify", func() {
-				res = Identify(context.Background(), "127.0.0.1", port, testTimeout)
+				res = Identify(context.Background(), "127.0.0.1", "127.0.0.1", port, testTimeout)
 			})
 			// Whatever it decides, it must be a well-formed result: a
 			// known sentinel service name, never a crash and never a
@@ -425,7 +425,7 @@ func TestIdentifyHTTPMalformedHeadersDoNotPanic(t *testing.T) {
 			}()
 
 			mustNotPanic(t, "Identify", func() {
-				Identify(context.Background(), "127.0.0.1", port, testTimeout)
+				Identify(context.Background(), "127.0.0.1", "127.0.0.1", port, testTimeout)
 			})
 		})
 	}
@@ -455,7 +455,7 @@ func TestIdentifyNeverPanicsOnRandomBytes(t *testing.T) {
 			go serveBanner(ln, payload)
 
 			mustNotPanic(t, "Identify", func() {
-				Identify(context.Background(), "127.0.0.1", port, testTimeout)
+				Identify(context.Background(), "127.0.0.1", "127.0.0.1", port, testTimeout)
 			})
 			_ = i
 		})

@@ -50,6 +50,25 @@ write it against a local fake server instead (see existing tests in
 `internal/scanner`, `internal/fingerprint`, and `cmd/portpeek/cli_test.go`
 for the established pattern).
 
+For code that has to *decide* whether to touch the network at all before
+it touches it - the public-target safety gate in `cmd/portpeek`, for
+instance - a local fake server isn't the right tool, because the
+behavior under test is the decision itself, not anything a real
+connection would return. For that, use a package-level function-variable
+seam instead: a `var classifyFunc = safety.Classify` or `var scanFunc =
+scanner.Scan`-style indirection that defaults to the real implementation
+in production and that a test can substitute for a deterministic fake
+(see `cmd/portpeek/cmd_public_target_test.go`'s `stubClassifier`/
+`stubScanner` for the pattern). These seams must only ever be swapped by
+test code in the same package - never made configurable via a flag,
+environment variable, or anything reachable from the built binary - so
+they add a test hook without weakening production behavior. A real local
+listener and the fake-seam pattern aren't mutually exclusive: the same
+test file typically has both - fast, fully-mocked tests for the
+decision/wiring logic, plus at least one test that exercises the real,
+unstubbed code path against a local listener, so the fakes are checked
+against reality too.
+
 ### Project layout
 
 ```

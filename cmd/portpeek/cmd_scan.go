@@ -15,6 +15,16 @@ import (
 	"github.com/rithinkrishnakv/portpeek/internal/storage"
 )
 
+// scanFunc performs the actual TCP connect scan - see scanner.Scan, which
+// this defaults to. Like classifyFunc in helpers.go, it exists purely as
+// a test seam: it lets a CLI-level test exercise the public-target
+// safety gate's allow/refuse decision and the exact dial address cmdScan
+// computes and passes down, without performing any real network I/O or
+// depending on outbound connectivity. It is never overridden or made
+// configurable at runtime by any flag, environment variable, or user
+// input - the production `portpeek` binary always uses scanner.Scan.
+var scanFunc = scanner.Scan
+
 func cmdScan(args []string) int {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	portsSpec := fs.String("ports", "", "port specification, e.g. \"22,80,443\" or \"1-1000\" (default: common ports)")
@@ -66,13 +76,19 @@ func cmdScan(args []string) int {
 
 	ctx := context.Background()
 
-	if !checkPublicTargetAllowed(ctx, asset, *confirmPublic) {
+	// Resolve and classify asset.Host exactly once, here, and scan and
+	// fingerprint the resulting dialAddr for the rest of this invocation -
+	// never asset.Host again directly - so the address actually probed is
+	// guaranteed consistent with the address the public-target safety gate
+	// evaluated. See resolveScanTarget's doc comment in helpers.go.
+	dialAddr, ok := resolveScanTarget(ctx, asset, *confirmPublic)
+	if !ok {
 		return ExitError
 	}
 
 	startedAt := time.Now()
 
-	results := scanner.Scan(ctx, asset.Host, ports, scanner.Options{
+	results := scanFunc(ctx, dialAddr, ports, scanner.Options{
 		Timeout:     timeout,
 		Concurrency: config.DefaultConcurrency,
 	})
@@ -85,7 +101,12 @@ func cmdScan(args []string) int {
 			State: string(r.State),
 		}
 		if r.State == scanner.StateOpen {
-			fp := fingerprint.Identify(ctx, asset.Host, r.Port, timeout)
+			// dialAddr is what every connection is actually made to;
+			// asset.Host (the original hostname, or the same IP literal
+			// if the asset has no separate hostname) is passed only as
+			// sniHost, for the HTTP Host header and TLS SNI - see
+			// fingerprint.Identify's doc comment.
+			fp := fingerprint.Identify(ctx, dialAddr, asset.Host, r.Port, timeout)
 			o.Service = strPtrIfSet(fp.Service)
 			o.VersionInfo = strPtrIfSet(fp.VersionInfo)
 			o.Banner = strPtrIfSet(fp.Banner)

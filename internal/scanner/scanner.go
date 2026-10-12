@@ -47,6 +47,16 @@ type Options struct {
 // ports, the kernel's own RST) - no payload is written during scanning.
 // Payload-level probing happens later, and only against ports found open,
 // in the fingerprint package.
+//
+// host is dialed as given, via net.Dialer, which resolves it itself if
+// it's a hostname rather than an IP literal. A caller that has already
+// resolved and classified its target - as cmd_scan.go's public-target
+// safety gate does, via internal/safety.Classify - should pass that
+// already-resolved address here (an IP literal) rather than the original
+// hostname, so Scan performs no DNS resolution of its own and the address
+// actually probed is guaranteed to be the one that was already classified,
+// not a possibly-different, freshly re-resolved one. See
+// docs/design.md's "DNS resolution consistency" section.
 func Scan(ctx context.Context, host string, ports []int, opts Options) []Result {
 	if opts.Timeout <= 0 {
 		opts.Timeout = 1200 * time.Millisecond

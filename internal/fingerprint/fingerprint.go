@@ -82,14 +82,33 @@ var portHints = map[int]string{
 // not send database wire-protocol bytes to arbitrary unknown ports.
 var fallbackOrder = []string{"ssh", "ftp", "smtp", "https", "http"}
 
-// Identify attempts to determine what service is listening on host:port.
-// It assumes the caller has already confirmed the port is open (e.g. via
-// scanner.Scan); Identify performs its own fresh connection(s) for probing.
-func Identify(ctx context.Context, host string, port int, timeout time.Duration) Result {
+// Identify attempts to determine what service is listening on
+// dialAddr:port. It assumes the caller has already confirmed the port is
+// open (e.g. via scanner.Scan); Identify performs its own fresh
+// connection(s) for probing.
+//
+// dialAddr and sniHost are deliberately separate parameters:
+//
+//   - dialAddr is the literal address every connection this call makes is
+//     actually dialed to. Callers that have already resolved and
+//     classified a target (see internal/safety and cmd_scan.go's
+//     public-target safety gate) should pass that already-resolved
+//     address here - typically an IP literal - rather than a hostname, so
+//     Identify performs no DNS resolution of its own and the address
+//     fingerprinted is guaranteed to be the one the caller already
+//     checked, not a freshly (and possibly differently) re-resolved one.
+//   - sniHost is used only for protocol content that must stay
+//     hostname-based regardless of which literal address the bytes are
+//     sent to: the HTTP `Host:` header (httpProbe) and the TLS
+//     ServerName / SNI extension (httpsProbe), both needed for correct
+//     identification of a virtual-hosted service. For a target with no
+//     separate hostname (a bare IP asset), callers should pass the same
+//     value for both.
+func Identify(ctx context.Context, dialAddr, sniHost string, port int, timeout time.Duration) Result {
 	tried := make(map[string]bool)
 
 	if hint, ok := portHints[port]; ok {
-		if res, matched := safeProbeFamily(ctx, hint, host, port, timeout); matched {
+		if res, matched := safeProbeFamily(ctx, hint, dialAddr, sniHost, port, timeout); matched {
 			return res
 		}
 		tried[hint] = true
@@ -100,12 +119,12 @@ func Identify(ctx context.Context, host string, port int, timeout time.Duration)
 			continue
 		}
 		tried[fam] = true
-		if res, matched := safeProbeFamily(ctx, fam, host, port, timeout); matched {
+		if res, matched := safeProbeFamily(ctx, fam, dialAddr, sniHost, port, timeout); matched {
 			return res
 		}
 	}
 
-	if res, matched := safeGenericBannerProbe(ctx, host, port, timeout); matched {
+	if res, matched := safeGenericBannerProbe(ctx, dialAddr, port, timeout); matched {
 		return res
 	}
 
@@ -120,13 +139,13 @@ func Identify(ctx context.Context, host string, port int, timeout time.Duration)
 // take down the whole scan; a recovered panic is treated exactly like an
 // ordinary "no match", and Identify simply moves on to the next family or
 // the generic fallback, the same as it would for any other non-match.
-func safeProbeFamily(ctx context.Context, family, host string, port int, timeout time.Duration) (res Result, matched bool) {
+func safeProbeFamily(ctx context.Context, family, dialAddr, sniHost string, port int, timeout time.Duration) (res Result, matched bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			res, matched = Result{}, false
 		}
 	}()
-	return probeFamily(ctx, family, host, port, timeout)
+	return probeFamily(ctx, family, dialAddr, sniHost, port, timeout)
 }
 
 func safeGenericBannerProbe(ctx context.Context, host string, port int, timeout time.Duration) (res Result, matched bool) {
@@ -138,24 +157,28 @@ func safeGenericBannerProbe(ctx context.Context, host string, port int, timeout 
 	return genericBannerProbe(ctx, host, port, timeout)
 }
 
-func probeFamily(ctx context.Context, family, host string, port int, timeout time.Duration) (Result, bool) {
+// probeFamily dispatches to one protocol family's probe. Only the two
+// HTTP(S) probes need sniHost (for the Host header / TLS SNI); every other
+// family only ever dials dialAddr and never puts a hostname into protocol
+// content, so they're passed dialAddr alone.
+func probeFamily(ctx context.Context, family, dialAddr, sniHost string, port int, timeout time.Duration) (Result, bool) {
 	switch family {
 	case "ssh":
-		return sshProbe(ctx, host, port, timeout)
+		return sshProbe(ctx, dialAddr, port, timeout)
 	case "ftp":
-		return ftpProbe(ctx, host, port, timeout)
+		return ftpProbe(ctx, dialAddr, port, timeout)
 	case "smtp":
-		return smtpProbe(ctx, host, port, timeout)
+		return smtpProbe(ctx, dialAddr, port, timeout)
 	case "mysql":
-		return mysqlProbe(ctx, host, port, timeout)
+		return mysqlProbe(ctx, dialAddr, port, timeout)
 	case "postgres":
-		return postgresProbe(ctx, host, port, timeout)
+		return postgresProbe(ctx, dialAddr, port, timeout)
 	case "redis":
-		return redisProbe(ctx, host, port, timeout)
+		return redisProbe(ctx, dialAddr, port, timeout)
 	case "https":
-		return httpsProbe(ctx, host, port, timeout)
+		return httpsProbe(ctx, dialAddr, sniHost, port, timeout)
 	case "http":
-		return httpProbe(ctx, host, port, timeout)
+		return httpProbe(ctx, dialAddr, sniHost, port, timeout)
 	}
 	return Result{}, false
 }

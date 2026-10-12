@@ -13,11 +13,16 @@ import (
 
 const maxBannerLen = 160
 
-func dial(ctx context.Context, host string, port int, timeout time.Duration) (net.Conn, error) {
+// dial opens a plain TCP connection to dialAddr:port. dialAddr is expected
+// to be the address the caller has already decided to connect to -
+// typically an already-resolved IP literal passed all the way down from
+// Identify (see its doc comment) - so this performs no DNS resolution of
+// its own.
+func dial(ctx context.Context, dialAddr string, port int, timeout time.Duration) (net.Conn, error) {
 	d := net.Dialer{Timeout: timeout}
 	dialCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return d.DialContext(dialCtx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	return d.DialContext(dialCtx, "tcp", net.JoinHostPort(dialAddr, strconv.Itoa(port)))
 }
 
 // readLine reads a single line (up to maxBannerLen bytes) from conn,
@@ -279,16 +284,26 @@ func redisProbe(ctx context.Context, host string, port int, timeout time.Duratio
 
 // --- HTTPS (TLS) -----------------------------------------------------------
 
-func httpsProbe(ctx context.Context, host string, port int, timeout time.Duration) (Result, bool) {
+func httpsProbe(ctx context.Context, dialAddr, sniHost string, port int, timeout time.Duration) (Result, bool) {
 	d := net.Dialer{Timeout: timeout}
 	dialCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// The connection itself is made to dialAddr (the already-resolved
+	// address the caller pinned - see Identify's doc comment), but
+	// ServerName is set explicitly to sniHost, the original hostname: SNI
+	// must reflect the hostname a real client would have used, regardless
+	// of which literal address the handshake bytes are sent to, so a
+	// virtual-hosted HTTPS service is still identified correctly. If
+	// sniHost is itself an IP literal (a bare-IP asset), crypto/tls simply
+	// omits SNI, exactly as it always has for an IP-literal target.
+	//
 	// InsecureSkipVerify is intentional and scoped to fingerprinting only:
 	// PortPeek is identifying what is listening, not asserting that its
 	// certificate is trustworthy. No certificate contents are trusted or
 	// acted on beyond "a TLS handshake completed".
-	tlsConn, err := tls.DialWithDialer(&d, "tcp", net.JoinHostPort(host, strconv.Itoa(port)), &tls.Config{
+	tlsConn, err := tls.DialWithDialer(&d, "tcp", net.JoinHostPort(dialAddr, strconv.Itoa(port)), &tls.Config{
+		ServerName:         sniHost,
 		InsecureSkipVerify: true, // #nosec G402 - fingerprint only, see comment above
 	})
 	_ = dialCtx
@@ -299,7 +314,7 @@ func httpsProbe(ctx context.Context, host string, port int, timeout time.Duratio
 
 	evidence := "TLS handshake completed"
 	server := ""
-	if s, ok := trySimpleHTTPRequest(tlsConn, host, timeout); ok {
+	if s, ok := trySimpleHTTPRequest(tlsConn, sniHost, timeout); ok {
 		server = s
 		evidence = "TLS handshake completed; HTTP response observed over TLS"
 	}
@@ -314,14 +329,17 @@ func httpsProbe(ctx context.Context, host string, port int, timeout time.Duratio
 
 // --- HTTP ------------------------------------------------------------------
 
-func httpProbe(ctx context.Context, host string, port int, timeout time.Duration) (Result, bool) {
-	conn, err := dial(ctx, host, port, timeout)
+func httpProbe(ctx context.Context, dialAddr, sniHost string, port int, timeout time.Duration) (Result, bool) {
+	conn, err := dial(ctx, dialAddr, port, timeout)
 	if err != nil {
 		return Result{}, false
 	}
 	defer conn.Close()
 
-	server, ok := trySimpleHTTPRequest(conn, host, timeout)
+	// The TCP connection is made to dialAddr, but the Host header sent is
+	// sniHost (the original hostname) - see Identify's doc comment for
+	// why these are kept separate.
+	server, ok := trySimpleHTTPRequest(conn, sniHost, timeout)
 	if !ok {
 		return Result{}, false
 	}

@@ -571,7 +571,12 @@ substitute for the authorization requirement above, which no automated
 check can verify. An address is considered private if it's loopback,
 RFC1918/RFC4193 private, or link-local; everything else, including CGNAT
 (`100.64.0.0/10`), is treated as public, since PortPeek has no way to know
-whether that counts as "safe" for your network.
+whether that counts as "safe" for your network. A hostname is resolved
+once and the resulting address is what's actually scanned — not
+re-resolved later — so the address this check evaluates and the address
+`scan` connects to are always the same one; see
+[docs/design.md](docs/design.md#dns-resolution-consistency) for why that
+matters.
 
 ```console
 $ portpeek scan some-host
